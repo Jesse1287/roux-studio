@@ -25,23 +25,25 @@
     </button>
 
     <nav class="site-nav" id="site-nav" aria-hidden="true">
-      <li><a href="<?php echo home_url('/'); ?>" <?php echo is_front_page() ? 'class="active"' : ''; ?>>Home</a></li>
-      <li><a href="<?php echo home_url('/booking/'); ?>" <?php echo is_page('booking') ? 'class="active"' : ''; ?>>Book</a></li>
-      <li><a href="<?php echo home_url('/gigs/'); ?>" <?php echo is_page('gigs') ? 'class="active"' : ''; ?>>Gigs</a></li>
-      <li><a href="<?php echo home_url('/equipment/'); ?>" <?php echo is_page('equipment') ? 'class="active"' : ''; ?>>Equipment</a></li>
-      <li><a href="<?php echo home_url('/blog/'); ?>" <?php echo is_page('blog') || is_singular('post') ? 'class="active"' : ''; ?>>Blog</a></li>
-      <?php if ($logged_in) : ?>
-        <li><a href="<?php echo home_url('/client-area/'); ?>" <?php echo is_page('client-area') ? 'class="active"' : ''; ?>>Clients</a></li>
-        <li><a href="<?php echo home_url('/dashboard/'); ?>" <?php echo is_page('dashboard') ? 'class="active"' : ''; ?>>Dashboard</a></li>
-      <?php endif; ?>
-      <li class="nav-auth">
+      <ul style="list-style:none;margin:0;padding:0;width:100%;">
+        <li><a href="<?php echo home_url('/'); ?>" <?php echo is_front_page() ? 'class="active"' : ''; ?>>Home</a></li>
+        <li><a href="<?php echo home_url('/booking/'); ?>" <?php echo is_page('booking') ? 'class="active"' : ''; ?>>Book</a></li>
+        <li><a href="<?php echo home_url('/gigs/'); ?>" <?php echo is_page('gigs') ? 'class="active"' : ''; ?>>Gigs</a></li>
+        <li><a href="<?php echo home_url('/equipment/'); ?>" <?php echo is_page('equipment') ? 'class="active"' : ''; ?>>Equipment</a></li>
+        <li><a href="<?php echo home_url('/blog/'); ?>" <?php echo is_page('blog') || is_singular('post') ? 'class="active"' : ''; ?>>Blog</a></li>
         <?php if ($logged_in) : ?>
-          <span class="nav-user-greeting">Hi, <?php echo esc_html($current_user->display_name); ?></span>
-          <a href="<?php echo wp_logout_url(home_url()); ?>" class="nav-login-btn">Logout</a>
-        <?php else : ?>
-          <a href="<?php echo wp_login_url(get_permalink()); ?>" class="nav-login-btn">Login</a>
+          <li><a href="<?php echo home_url('/client-area/'); ?>" <?php echo is_page('client-area') ? 'class="active"' : ''; ?>>Clients</a></li>
+          <li><a href="<?php echo home_url('/dashboard/'); ?>" <?php echo is_page('dashboard') ? 'class="active"' : ''; ?>>Dashboard</a></li>
         <?php endif; ?>
-      </li>
+        <li class="nav-auth">
+          <?php if ($logged_in) : ?>
+            <span class="nav-user-greeting">Hi, <?php echo esc_html($current_user->display_name); ?></span>
+            <a href="<?php echo wp_logout_url(home_url()); ?>" class="nav-login-btn">Logout</a>
+          <?php else : ?>
+            <a href="<?php echo wp_login_url(get_permalink()); ?>" class="nav-login-btn">Login</a>
+          <?php endif; ?>
+        </li>
+      </ul>
     </nav>
   </div>
 </header>
