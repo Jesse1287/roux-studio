@@ -49,7 +49,7 @@ function studio_verify_token($post_id, $token) {
    ENQUEUE SCRIPTS & STYLES
    ---------------------------------------------- */
 function studio_scripts() {
-    wp_enqueue_style('studio-roux', get_stylesheet_uri(), [], '3.3.0');
+    wp_enqueue_style('studio-roux', get_stylesheet_uri(), [], filemtime(get_template_directory() . '/style.css'));
 
     if (is_page_template('page-booking.php')) {
         wp_enqueue_script('studio-booking', '', [], '1.0', true);

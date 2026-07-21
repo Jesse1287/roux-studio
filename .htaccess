@@ -8,25 +8,3 @@ RewriteCond %{REQUEST_FILENAME} !-d
 RewriteRule . /index.php [L]
 </IfModule>
 # END WordPress
-
-# Block sensitive files
-<FilesMatch "^(wp-config\.php|xmlrpc\.php|\.htaccess)$">
-Order Allow,Deny
-Deny from all
-</FilesMatch>
-
-# Block backup files
-<FilesMatch "\.(bak|swp|orig|save|dist)$">
-Order Allow,Deny
-Deny from all
-</FilesMatch>
-
-# Block directory browsing
-Options -Indexes
-
-# Security headers
-<IfModule mod_headers.c>
-Header set X-Content-Type-Options "nosniff"
-Header set X-Frame-Options "SAMEORIGIN"
-Header set Referrer-Policy "strict-origin-when-cross-origin"
-</IfModule>
