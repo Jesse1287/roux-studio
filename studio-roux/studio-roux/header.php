@@ -25,7 +25,7 @@
     </button>
 
     <nav class="site-nav" id="site-nav" aria-hidden="true">
-      <ul style="list-style:none;margin:0;padding:0;width:100%;">
+      <ul>
         <li><a href="<?php echo home_url('/'); ?>" <?php echo is_front_page() ? 'class="active"' : ''; ?>>Home</a></li>
         <li><a href="<?php echo home_url('/booking/'); ?>" <?php echo is_page('booking') ? 'class="active"' : ''; ?>>Book</a></li>
         <li><a href="<?php echo home_url('/gigs/'); ?>" <?php echo is_page('gigs') ? 'class="active"' : ''; ?>>Gigs</a></li>

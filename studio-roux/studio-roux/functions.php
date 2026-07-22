@@ -49,7 +49,7 @@ function studio_verify_token($post_id, $token) {
    ENQUEUE SCRIPTS & STYLES
    ---------------------------------------------- */
 function studio_scripts() {
-    wp_enqueue_style('studio-roux', get_stylesheet_uri(), [], '3.3.0');
+    wp_enqueue_style('studio-roux', get_stylesheet_uri(), [], filemtime(get_template_directory() . '/style.css'));
 
     if (is_page_template('page-booking.php')) {
         wp_enqueue_script('studio-booking', '', [], '1.0', true);
@@ -68,7 +68,7 @@ function studio_scripts() {
     var c = document.getElementById("slot-container");
     var r = document.createElement("div");
     r.className = "slot-row";
-    r.innerHTML = "<input type=\"date\" name=\"slot_date[]\" required><input type=\"time\" name=\"slot_start[]\" placeholder=\"Start\" required><input type=\"time\" name=\"slot_end[]\" placeholder=\"End\" required>";
+        r.innerHTML = "<input type=\"date\" name=\"slot_date[]\"><input type=\"time\" name=\"slot_start[]\" placeholder=\"Start\"><input type=\"time\" name=\"slot_end[]\" placeholder=\"End\">";
     c.appendChild(r);
   });
   var form = document.querySelector("form");
@@ -83,7 +83,6 @@ function studio_scripts() {
         return;
       }
     }
-  });
   });
 })();';
         wp_add_inline_script('studio-booking', $booking_js);

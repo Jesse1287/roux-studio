@@ -68,9 +68,9 @@ if (isset($_GET['booking']) && $_GET['booking'] === 'sent') : ?>
             <label>Sessions (Date + Time)</label>
             <div id="slot-container">
               <div class="slot-row">
-                <input type="date" name="slot_date[]" required>
-                <input type="time" name="slot_start[]" placeholder="Start" required>
-                <input type="time" name="slot_end[]" placeholder="End" required>
+                <input type="date" name="slot_date[]">
+                <input type="time" name="slot_start[]" placeholder="Start">
+                <input type="time" name="slot_end[]" placeholder="End">
               </div>
             </div>
             <button type="button" class="btn btn-sm" id="add-slot-btn" style="margin-top:8px;">+ Add Another Session</button>
