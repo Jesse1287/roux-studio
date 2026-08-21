@@ -1,0 +1,3 @@
+*.bak
+wp-config.php
+__pycache__/
