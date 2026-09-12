@@ -15,10 +15,7 @@ $args = [
 ];
 
 if ($current_cat && $current_cat !== 'all') {
-    $cat_id = get_cat_ID($current_cat);
-    if ($cat_id) {
-        $args['cat__in'] = [$cat_id];
-    }
+    $args['cat_name'] = $current_cat;
 }
 
 $blog = new WP_Query($args);
@@ -82,16 +79,7 @@ $categories = get_categories(['hide_empty' => true, 'orderby' => 'name', 'order'
 
       <?php if ($blog->max_num_pages > 1) : ?>
         <div style="display:flex;justify-content:center;gap:12px;margin-top:40px;">
-          <?php
-          $pagination = paginate_links(['prev_text' => '&laquo; Previous', 'next_text' => 'Next &raquo;', 'type' => 'array', 'total' => $blog->max_num_pages, 'current' => max(1, get_query_var('paged'))]);
-          if (is_array($pagination)) {
-              echo '<nav class="pagination">';
-              foreach ($pagination as $link) {
-                  echo '<span style="padding:8px 16px;border:1px solid var(--surface-border);border-radius:6px;color:var(--text-muted);text-decoration:none;">' . $link . '</span> ';
-              }
-              echo '</nav>';
-          }
-          ?>
+          <?php echo paginate_links(['prev_text' => '&laquo; Previous', 'next_text' => 'Next &raquo;', 'type' => 'plaintext']); ?>
         </div>
       <?php endif; ?>
 

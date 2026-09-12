@@ -29,7 +29,7 @@
         <li><a href="<?php echo home_url('/'); ?>" <?php echo is_front_page() ? 'class="active"' : ''; ?>>Home</a></li>
         <li><a href="<?php echo home_url('/booking/'); ?>" <?php echo is_page('booking') ? 'class="active"' : ''; ?>>Book</a></li>
         <li><a href="<?php echo home_url('/gigs/'); ?>" <?php echo is_page('gigs') ? 'class="active"' : ''; ?>>Gigs</a></li>
-        <li><a href="<?php echo home_url('/equipment/'); ?>" <?php echo is_page('equipment') ? 'class="active"' : ''; ?>>Equipment</a></li>
+        <li><a href="<?php echo get_permalink(10); ?>" <?php echo is_page('equipment') ? 'class="active"' : ''; ?>>Equipment</a></li>
         <li><a href="<?php echo home_url('/blog/'); ?>" <?php echo is_page('blog') || is_singular('post') ? 'class="active"' : ''; ?>>Blog</a></li>
         <?php if ($logged_in) : ?>
           <li><a href="<?php echo home_url('/client-area/'); ?>" <?php echo is_page('client-area') ? 'class="active"' : ''; ?>>Clients</a></li>
@@ -38,6 +38,9 @@
         <li class="nav-auth">
           <?php if ($logged_in) : ?>
             <span class="nav-user-greeting">Hi, <?php echo esc_html($current_user->display_name); ?></span>
+            <?php if (current_user_can('manage_options')) : ?>
+              <a href="<?php echo admin_url(); ?>" class="nav-login-btn" title="WordPress Admin">WP</a>
+            <?php endif; ?>
             <a href="<?php echo wp_logout_url(home_url()); ?>" class="nav-login-btn">Logout</a>
           <?php else : ?>
             <a href="<?php echo wp_login_url(get_permalink()); ?>" class="nav-login-btn">Login</a>
@@ -63,8 +66,7 @@
     nav.setAttribute('aria-hidden', 'false');
     toggle.classList.add('active');
     toggle.setAttribute('aria-expanded', 'true');
-    if (overlay) overlay.classList.add('open');
-    document.body.classList.add('nav-open');
+    toggle.setAttribute('aria-label', 'Close menu');
   }
 
   function closeNav() {
@@ -72,8 +74,7 @@
     nav.setAttribute('aria-hidden', 'true');
     toggle.classList.remove('active');
     toggle.setAttribute('aria-expanded', 'false');
-    if (overlay) overlay.classList.remove('open');
-    document.body.classList.remove('nav-open');
+    toggle.setAttribute('aria-label', 'Menu');
   }
 
   toggle.addEventListener('click', function(e) {
@@ -86,9 +87,18 @@
     }
   });
 
-  if (overlay) {
-    overlay.addEventListener('click', closeNav);
-  }
+  document.addEventListener('click', function(e) {
+    if (nav.classList.contains('open') && !nav.contains(e.target) && !toggle.contains(e.target)) {
+      closeNav();
+    }
+  });
+
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' && nav.classList.contains('open')) {
+      closeNav();
+      toggle.focus();
+    }
+  });
 
   nav.querySelectorAll('a').forEach(function(a) {
     a.addEventListener('click', closeNav);
