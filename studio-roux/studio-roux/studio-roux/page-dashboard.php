@@ -4,7 +4,6 @@
  */
 get_header();
 if (!is_user_logged_in()) { wp_redirect(wp_login_url(get_permalink())); exit; }
-if (!current_user_can('manage_options')) { echo '<div class="container" style="padding:120px 0;"><p>Restricted.</p></div>'; get_footer(); exit; }
 $user = wp_get_current_user();
 
 // Counts
@@ -21,7 +20,7 @@ $pending = count($pending_bookings);
 // This month financials
 $revenue_month = 0;
 $month_invoices = get_posts(['post_type' => 'studio_invoice', 'post_status' => 'publish', 'numberposts' => -1, 'date_query' => [['year' => date('Y'), 'month' => date('m')]]]);
-foreach ($month_invoices as $inv) { if (get_post_meta($inv->ID, '_deposit_paid', true) || get_post_meta($inv->ID, '_status', true) === 'Paid') { $revenue_month += floatval(get_post_meta($inv->ID, '_total', true)); } }
+foreach ($month_invoices as $inv) { if (get_post_meta($inv->ID, '_deposit_paid', true)) { $revenue_month += floatval(get_post_meta($inv->ID, '_total', true)); } }
 
 $expenses_month = 0;
 $month_expenses = get_posts(['post_type' => 'studio_expense', 'post_status' => 'publish', 'numberposts' => -1, 'date_query' => [['year' => date('Y'), 'month' => date('m')]]]);
@@ -32,7 +31,7 @@ $net_month = $revenue_month - $expenses_month;
 // Year totals
 $revenue_year = 0;
 $year_invoices = get_posts(['post_type' => 'studio_invoice', 'post_status' => 'publish', 'numberposts' => -1, 'date_query' => [['year' => date('Y')]]]);
-foreach ($year_invoices as $inv) { if (get_post_meta($inv->ID, '_deposit_paid', true) || get_post_meta($inv->ID, '_status', true) === 'Paid') { $revenue_year += floatval(get_post_meta($inv->ID, '_total', true)); } }
+foreach ($year_invoices as $inv) { if (get_post_meta($inv->ID, '_deposit_paid', true)) { $revenue_year += floatval(get_post_meta($inv->ID, '_total', true)); } }
 
 $expenses_year = 0;
 $year_expenses = get_posts(['post_type' => 'studio_expense', 'post_status' => 'publish', 'numberposts' => -1, 'date_query' => [['year' => date('Y')]]]);
@@ -41,7 +40,7 @@ foreach ($year_expenses as $ex) { $expenses_year += floatval(get_post_meta($ex->
 $net_year = $revenue_year - $expenses_year;
 
 // Upcoming gigs
-$upcoming_gigs = get_posts(['post_type' => 'studio_gig', 'post_status' => 'publish', 'numberposts' => 5, 'meta_query' => [['key' => '_gig_date', 'value' => date('Y-m-d'), 'compare' => '>=']], 'orderby' => 'meta_value', 'meta_key' => '_gig_date', 'order' => 'ASC']);
+$upcoming_gigs = get_posts(['post_type' => 'studio_gig', 'post_status' => 'publish', 'numberposts' => 5, 'meta_key' => '_gig_date', 'meta_value' => date('Y-m-d'), 'compare' => '>=', 'orderby' => 'meta_value', 'order' => 'ASC']);
 ?>
 <main class="page-content">
   <div class="container">

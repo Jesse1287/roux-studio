@@ -2,26 +2,15 @@
 /**
  * Template Name: Client Area
  */
-header("X-Frame-Options: SAMEORIGIN");
-header("Content-Security-Policy: upgrade-insecure-requests; frame-ancestors 'self'");
 get_header();
 
 $booking = null;
-$booking_id = 0;
-
-// Rate-limit lookups to prevent enumeration brute-force (15 per hour per IP)
-$ip = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
-$rate_key = 'client_area_rate_' . $ip;
-$attempts = intval(get_transient($rate_key)) + 1;
-if ($attempts > 15) {
-	wp_die('Too many lookup attempts. Please wait an hour before trying again.', 'Access Throttled', ['response' => 429]);
-}
-set_transient($rate_key, $attempts, HOUR_IN_SECONDS);
 
 // Token-based access (from email links)
 if (isset($_GET['token']) && !empty($_GET['token'])) {
     $token = sanitize_text_field($_GET['token']);
-    $all = get_posts(['post_type' => 'studio_booking', 'post_status' => 'publish', 'meta_key' => '_access_token', 'meta_value' => $token, 'numberposts' => 1]);
+    // Search all bookings for matching token
+    $all = get_posts(['post_type' => 'studio_booking', 'post_status' => 'publish', 'numberposts' => -1, 'meta_key' => '_access_token', 'meta_value' => $token]);
     if (!empty($all)) {
         $booking = $all[0];
     }
@@ -29,23 +18,23 @@ if (isset($_GET['token']) && !empty($_GET['token'])) {
 
 // Email + reference lookup
 if (!$booking && isset($_GET['ref']) && isset($_GET['email'])) {
-    $ref   = sanitize_text_field($_GET['ref']);
+    $ref = sanitize_text_field($_GET['ref']);
     $email = sanitize_email($_GET['email']);
     $booking_id = intval(str_replace('#', '', $ref));
 
     if ($booking_id > 0) {
-        global $wpdb;
-        $stored = $wpdb->get_var($wpdb->prepare(
-            "SELECT meta_value FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = '_client_email'",
-            $booking_id
-        ));
         $b = get_post($booking_id);
-        if ($b && $b->post_type === 'studio_booking' && $stored === $email) {
-			$booking = $b;
-		}
+        if ($b && $b->post_type === 'studio_booking' && get_post_meta($b->ID, '_client_email', true) === $email) {
+            $booking = $b;
+        }
+    }
+
+    if (!$booking) {
+        $q = new WP_Query(['post_type' => 'studio_booking', 'post_status' => 'publish', 'meta_query' => [['key' => '_client_email', 'value' => $email]], 'posts_per_page' => 1]);
+        if ($q->have_posts()) { $booking = $q->posts[0]; }
+        wp_reset_postdata();
     }
 }
-
 ?>
 <main class="page-content">
   <div class="container container-narrow">
@@ -186,7 +175,7 @@ if (!$booking && isset($_GET['ref']) && isset($_GET['email'])) {
         </div>
         <?php endif; ?>
 
-        <?php if ($invoice && $status !== 'Declined') :
+        <?php if ($invoice && $status === 'Approved') :
             $inv_total = floatval(get_post_meta($invoice->ID, '_total', true));
             $inv_deposit = floatval(get_post_meta($invoice->ID, '_deposit', true));
             $inv_deposit_paid = get_post_meta($invoice->ID, '_deposit_paid', true);

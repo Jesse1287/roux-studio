@@ -32,8 +32,8 @@ get_header(); ?>
         $condition_counts[$cond] = ($condition_counts[$cond] ?? 0) + 1;
       }
       wp_reset_postdata();
-      $equip->rewind_posts();
     }
+    $equip = new WP_Query($args); // reset query
     ?>
 
     <?php if ($total_items > 0) : ?>
@@ -47,6 +47,7 @@ get_header(); ?>
         <div class="stat-label">Total Value</div>
       </div>
       <?php
+      $cond_colors = ['Excellent' => 'approved', 'Good' => 'sent', 'Fair' => 'new', 'Poor' => 'declined', 'Needs Repair' => 'declined'];
       $shown = 0;
       foreach (['Excellent', 'Good', 'Fair', 'Poor', 'Needs Repair'] as $c) {
         if (isset($condition_counts[$c]) && $shown < 2) {

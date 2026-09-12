@@ -26,10 +26,6 @@ if (isset($_GET['booking']) && $_GET['booking'] === 'sent') : ?>
       <div class="alert alert-error">There was an error submitting your booking. Please try again.</div>
     <?php endif; ?>
 
-    <?php if (isset($_GET['booking']) && $_GET['booking'] === 'rate_limited') : ?>
-      <div class="alert alert-error">Too many booking attempts. Please try again later.</div>
-    <?php endif; ?>
-
     <div class="glass">
       <form method="post" action="">
         <?php wp_nonce_field('studio_booking_submit', '_booking_nonce'); ?>
@@ -63,18 +59,33 @@ if (isset($_GET['booking']) && $_GET['booking'] === 'sent') : ?>
           </select>
         </div>
 
-        <div id="hourly-slots" style="display:none;">
-          <div class="form-group">
-            <label>Sessions (Date + Time)</label>
-            <div id="slot-container">
-              <div class="slot-row">
-                <input type="date" name="slot_date[]" required>
-                <input type="time" name="slot_start[]" placeholder="Start" required>
-                <input type="time" name="slot_end[]" placeholder="End" required>
+        <div class="form-group">
+          <label>Sessions (Date + Time)</label>
+          <div id="slot-container">
+            <div class="slot-row">
+              <div class="slot-field">
+                <label for="slot_date_0">Date</label>
+                <input type="date" id="slot_date_0" name="slot_date[]" required>
+              </div>
+              <div class="slot-field">
+                <label for="slot_start_0">Start Time</label>
+                <input type="time" id="slot_start_0" name="slot_start[]" required>
+              </div>
+              <div class="slot-field">
+                <label for="slot_end_0">End Time</label>
+                <input type="time" id="slot_end_0" name="slot_end[]" required>
               </div>
             </div>
-            <button type="button" class="btn btn-sm" id="add-slot-btn" style="margin-top:8px;">+ Add Another Session</button>
           </div>
+          <button type="button" class="btn btn-sm" id="add-slot-btn" style="margin-top:8px;">+ Add Another Session</button>
+        </div>
+
+        <div id="estimate-box" style="display:none;margin:16px 0;padding:16px;border:1px solid var(--gold);border-radius:8px;background:rgba(212,165,116,0.05);">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <span style="color:var(--text-muted);font-size:0.9rem;">Estimated Total:</span>
+            <strong id="estimate-amount" style="font-size:1.4rem;color:var(--gold);">$0.00</strong>
+          </div>
+          <p id="estimate-note" style="margin:8px 0 0;font-size:0.75rem;color:var(--text-muted);">Final amount confirmed after booking review.</p>
         </div>
 
         <div class="form-group">
@@ -94,5 +105,79 @@ if (isset($_GET['booking']) && $_GET['booking'] === 'sent') : ?>
     </div>
   </div>
 </main>
+<script>
+(function(){
+  var rates = {
+    "Tier 1": {rate:75,hourly:true},
+    "Tier 2": {rate:150,hourly:false},
+    "Tier 3": {rate:200,hourly:false},
+    "Tier 4": {rate:250,hourly:false},
+    "FOH Engineer": {rate:50,hourly:true},
+    "Consultation": {rate:0,hourly:false}
+  };
+  function getRate(svc){
+    if(!svc) return null;
+    for(var k in rates){ if(svc.indexOf(k)!==-1) return rates[k]; }
+    return {rate:75,hourly:true};
+  }
+  function calcHours(s,e){
+    if(!s||!e) return 0;
+    var sp=s.split(":"),ep=e.split(":");
+    var diff=(parseInt(ep[0])*60+parseInt(ep[1]))-(parseInt(sp[0])*60+parseInt(sp[1]));
+    return diff>0?Math.round(diff/60*4)/4:0;
+  }
+  function updateEstimate(){
+    var svc=document.getElementById("service");
+    var info=getRate(svc?svc.value:"");
+    var estBox=document.getElementById("estimate-box");
+    var estAmt=document.getElementById("estimate-amount");
+    var estNote=document.getElementById("estimate-note");
+    if(!info||!estBox||!estAmt){return;}
+    if(info.rate===0){estBox.style.display="none";return;}
+    estBox.style.display="block";
+    if(info.hourly){
+      var totalH=0;
+      var rows=document.querySelectorAll(".slot-row");
+      for(var i=0;i<rows.length;i++){
+        var st=rows[i].querySelector("input[name*=slot_start]");
+        var en=rows[i].querySelector("input[name*=slot_end]");
+        totalH+=calcHours(st?st.value:"",en?en.value:"");
+      }
+      if(totalH<=0){estAmt.textContent="$"+info.rate+"/hr";if(estNote)estNote.textContent="Select dates & times to see your total.";return;}
+      estAmt.textContent="$"+(info.rate*totalH).toFixed(2)+" ("+totalH+" hrs \u00d7 $"+info.rate+"/hr)";
+      if(estNote)estNote.textContent="Final amount confirmed after booking review.";
+    }else{
+      estAmt.textContent="$"+info.rate.toFixed(2);
+      if(estNote)estNote.textContent="Flat rate \u2014 final amount confirmed after booking review.";
+    }
+  }
+  var svc=document.getElementById("service");
+  if(svc) svc.addEventListener("change",updateEstimate);
+  var addBtn=document.getElementById("add-slot-btn");
+  if(addBtn) addBtn.addEventListener("click",function(){
+    var c=document.getElementById("slot-container");
+    var r=document.createElement("div");
+    r.className="slot-row";
+    r.innerHTML='<div class="slot-field"><label>Date</label><input type="date" name="slot_date[]" required></div><div class="slot-field"><label>Start Time</label><input type="time" name="slot_start[]" required></div><div class="slot-field"><label>End Time</label><input type="time" name="slot_end[]" required></div>';
+    c.appendChild(r);
+    r.querySelectorAll("input").forEach(function(inp){inp.addEventListener("change",updateEstimate);});
+  });
+  document.querySelectorAll(".slot-row input").forEach(function(inp){inp.addEventListener("change",updateEstimate);});
+  updateEstimate();
+  var form=document.querySelector("form");
+  if(form) form.addEventListener("submit",function(e){
+    var slots=document.querySelectorAll(".slot-row");
+    for(var i=0;i<slots.length;i++){
+      var st=slots[i].querySelector("input[name*=slot_start]");
+      var en=slots[i].querySelector("input[name*=slot_end]");
+      if(st&&en&&st.value&&en.value&&en.value<=st.value){
+        e.preventDefault();
+        alert("End time must be after start time.");
+        return;
+      }
+    }
+  });
+})();
+</script>
 <?php endif; ?>
 <?php get_footer(); ?>

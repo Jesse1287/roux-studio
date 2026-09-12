@@ -1,11 +1,18 @@
 <?php
-update_option('timezone_string', 'America/Chicago');
+// One-time timezone setup to avoid write on every request
+if (get_option('studio_timezone_initialized') !== '1') {
+	update_option('timezone_string', 'America/Chicago');
+	update_option('studio_timezone_initialized', '1');
+}
 add_theme_support('title-tag');
 add_theme_support('post-thumbnails');
 add_theme_support('html5', ['search-form', 'comment-form', 'comment-list', 'gallery', 'caption']);
 add_theme_support('customize-selective-refresh-widgets');
 
 register_nav_menus(['primary' => 'Primary Navigation']);
+
+/* Hide the WordPress admin bar on frontend — custom nav handles auth */
+add_filter('show_admin_bar', '__return_false');
 
 /* ----------------------------------------------
    SERVICE DEFINITIONS (machine-readable slugs)
@@ -50,44 +57,6 @@ function studio_verify_token($post_id, $token) {
    ---------------------------------------------- */
 function studio_scripts() {
     wp_enqueue_style('studio-roux', get_stylesheet_uri(), [], filemtime(get_template_directory() . '/style.css'));
-
-    if (is_page_template('page-booking.php')) {
-        wp_enqueue_script('studio-booking', '', [], '1.0', true);
-        $booking_js = '
-(function(){
-  var svc = document.getElementById("service");
-  if(!svc) return;
-  svc.addEventListener("change", function(){
-    var opt = this.options[this.selectedIndex];
-    var h = opt && opt.getAttribute("data-hourly") === "true";
-    var slots = document.getElementById("hourly-slots");
-    if(slots) slots.style.display = h ? "block" : "none";
-  });
-  var addBtn = document.getElementById("add-slot-btn");
-  if(addBtn) addBtn.addEventListener("click", function(){
-    var c = document.getElementById("slot-container");
-    var r = document.createElement("div");
-    r.className = "slot-row";
-    r.innerHTML = "<input type=\"date\" name=\"slot_date[]\" required><input type=\"time\" name=\"slot_start[]\" placeholder=\"Start\" required><input type=\"time\" name=\"slot_end[]\" placeholder=\"End\" required>";
-    c.appendChild(r);
-  });
-  var form = document.querySelector("form");
-  if(form) form.addEventListener("submit", function(e){
-    var slots = document.querySelectorAll(".slot-row");
-    for(var i=0;i<slots.length;i++){
-      var st = slots[i].querySelector("input[name*=slot_start]");
-      var en = slots[i].querySelector("input[name*=slot_end]");
-      if(st && en && st.value && en.value && en.value <= st.value){
-        e.preventDefault();
-        alert("End time must be after start time.");
-        return;
-      }
-    }
-  });
-  });
-})();';
-        wp_add_inline_script('studio-booking', $booking_js);
-    }
 }
 add_action('wp_enqueue_scripts', 'studio_scripts');
 
@@ -179,8 +148,235 @@ if (!wp_next_scheduled('studio_maintenance_reminder_event')) {
 add_action('studio_maintenance_reminder_event', 'studio_send_maintenance_reminders');
 
 /* ----------------------------------------------
-   BOOKING FORM HANDLER
-   ---------------------------------------------- */
+    FRONTEND INVOICE CREATION HANDLER
+    ---------------------------------------------- */
+function studio_frontend_invoice_handler() {
+    if (!is_user_logged_in()) return;
+    if (!current_user_can('manage_options')) return;
+    if (!isset($_POST['studio_create_invoice_frontend'])) return;
+
+    if (!isset($_POST['_invoice_frontend_nonce']) || !wp_verify_nonce($_POST['_invoice_frontend_nonce'], 'studio_create_invoice_frontend')) {
+        wp_safe_redirect(add_query_arg('invoice_error', 1, home_url('/invoice-dashboard/'))); exit;
+    }
+
+    $booking_id = intval($_POST['booking_id'] ?? 0);
+    $gig_id = intval($_POST['gig_id'] ?? 0);
+    $client_name = sanitize_text_field($_POST['client_name'] ?? '');
+    $client_email = sanitize_email($_POST['client_email'] ?? '');
+    $client_phone = sanitize_text_field($_POST['client_phone'] ?? '');
+    $event_date = sanitize_text_field($_POST['event_date'] ?? '');
+    $start_time = sanitize_text_field($_POST['start_time'] ?? '');
+    $end_time = sanitize_text_field($_POST['end_time'] ?? '');
+    $venue = sanitize_text_field($_POST['venue'] ?? '');
+    $service_type = sanitize_text_field($_POST['service_type'] ?? '');
+    $discount = floatval($_POST['discount'] ?? 0);
+    $discount_type = in_array(sanitize_text_field($_POST['discount_type'] ?? ''), ['percent', 'fixed']) ? sanitize_text_field($_POST['discount_type']) : 'percent';
+    $tax_rate = floatval($_POST['tax_rate'] ?? 0);
+    $tax_jurisdiction = sanitize_text_field($_POST['tax_jurisdiction'] ?? '');
+    $due_date = sanitize_text_field($_POST['due_date'] ?: date('Y-m-d', strtotime('+7 days')));
+    $inv_status = in_array(sanitize_text_field($_POST['invoice_status'] ?? ''), ['Draft', 'Sent', 'Paid']) ? sanitize_text_field($_POST['invoice_status']) : 'Draft';
+    $notes = sanitize_textarea_field($_POST['notes'] ?? '');
+
+    // Line items
+    $line_items = [];
+    $line_descs = $_POST['line_item_desc'] ?? [];
+    $line_qtys  = $_POST['line_item_qty']  ?? [];
+    $line_rates = $_POST['line_item_rate'] ?? [];
+
+    for ($i = 0; $i < count($line_descs); $i++) {
+        $desc = sanitize_text_field($line_descs[$i] ?? '');
+        $qty  = floatval($line_qtys[$i] ?? 0);
+        $rate = floatval($line_rates[$i] ?? 0);
+        if ($desc && $qty > 0 && $rate >= 0) {
+            $line_items[] = compact('desc', 'qty', 'rate');
+        }
+    }
+
+    if (empty($client_name)) {
+        wp_safe_redirect(add_query_arg('invoice_error', 1, home_url('/invoice-dashboard/'))); exit;
+    }
+
+    // Calculate totals from line items
+    $subtotal = 0;
+    foreach ($line_items as $li) $subtotal += $li['qty'] * $li['rate'];
+
+    $discount_amount = ($discount_type === 'percent') ? $subtotal * ($discount / 100) : $discount;
+    $after_discount = max(0, $subtotal - $discount_amount);
+    $tax_amount = $after_discount * ($tax_rate / 100);
+    $grand_total = $after_discount + $tax_amount;
+    $deposit = round($grand_total * 0.5, 2);
+
+    $invoice_id = wp_insert_post([
+        'post_type'   => 'studio_invoice',
+        'post_title'  => "Invoice for $client_name",
+        'post_status' => 'publish',
+    ]);
+
+    if (!$invoice_id) {
+        wp_safe_redirect(add_query_arg('invoice_error', 1, home_url('/invoice-dashboard/'))); exit;
+    }
+
+    update_post_meta($invoice_id, '_booking_id', $booking_id);
+    update_post_meta($invoice_id, '_gig_id', $gig_id);
+    update_post_meta($invoice_id, '_client_name', $client_name);
+    update_post_meta($invoice_id, '_client_email', $client_email);
+    update_post_meta($invoice_id, '_client_phone', $client_phone);
+    update_post_meta($invoice_id, '_event_date', $event_date);
+    update_post_meta($invoice_id, '_start_time', $start_time);
+    update_post_meta($invoice_id, '_end_time', $end_time);
+    update_post_meta($invoice_id, '_venue', $venue);
+    update_post_meta($invoice_id, '_service_type', $service_type);
+    update_post_meta($invoice_id, '_service', $service_type);
+    update_post_meta($invoice_id, '_line_items', $line_items);
+    update_post_meta($invoice_id, '_subtotal', $subtotal);
+    update_post_meta($invoice_id, '_discount', $discount);
+    update_post_meta($invoice_id, '_discount_type', $discount_type);
+    update_post_meta($invoice_id, '_discount_amount', $discount_amount);
+    update_post_meta($invoice_id, '_tax_rate', $tax_rate);
+    update_post_meta($invoice_id, '_tax_collected', $tax_amount);
+    update_post_meta($invoice_id, '_tax_jurisdiction', $tax_jurisdiction);
+    update_post_meta($invoice_id, '_total', $grand_total);
+    update_post_meta($invoice_id, '_deposit', $deposit);
+    update_post_meta($invoice_id, '_deposit_paid', 0);
+    update_post_meta($invoice_id, '_status', $inv_status);
+    update_post_meta($invoice_id, '_due_date', $due_date);
+    update_post_meta($invoice_id, '_created_at', current_time('mysql'));
+    update_post_meta($invoice_id, '_notes', $notes);
+
+    if ($booking_id) update_post_meta($booking_id, '_invoice_id', $invoice_id);
+    if ($gig_id) update_post_meta($gig_id, '_invoice_id', $invoice_id);
+
+    // Generate access token for client portal link
+    if (!get_post_meta($invoice_id, '_access_token', true)) {
+        studio_generate_token($invoice_id);
+    }
+
+    // Email admin notification
+    $admin = get_option('admin_email');
+    if ($admin) {
+        studio_send_email($admin, "New Invoice #{$invoice_id} Created — {$client_name}",
+            '<p>A new invoice has been created for <strong>' . esc_html($client_name) . '</strong>.</p>' .
+            studio_invoice_email_body($invoice_id) .
+            '<p><a href="' . get_edit_post_link($invoice_id) . '">View invoice</a></p>');
+    }
+
+    // Email client confirmation
+    if ($client_email) {
+        $pay_url = home_url("/booking-action/?action=pay_deposit&invoice_id={$invoice_id}&token=" . get_post_meta($invoice_id, '_access_token', true));
+        studio_send_email($client_email, "Invoice #{$invoice_id} — Roux Audio Production",
+            '<p>Hi ' . esc_html($client_name) . ',</p>' .
+            '<p>Your invoice is ready.</p>' .
+            studio_invoice_email_body($invoice_id) .
+            '<p><a href="' . $pay_url . '" style="display:inline-block;padding:12px 32px;background:#d4a574;color:#0a0a0a;text-decoration:none;border-radius:8px;font-weight:bold;">Pay Deposit via PayPal</a></p>');
+    }
+
+    wp_safe_redirect(add_query_arg('invoice_created', $invoice_id, home_url('/invoice-dashboard/'))); exit;
+}
+add_action('init', 'studio_frontend_invoice_handler');
+
+/* ----------------------------------------------
+    AJAX: Autopopulate from booking / gig selection
+    ---------------------------------------------- */
+function studio_ajax_autopopulate_booking() {
+    check_ajax_referer('studio_autopopulate', 'nonce');
+    if (!current_user_can('manage_options')) wp_send_json_error();
+    $id = intval($_POST['id']);
+    $raw_service = get_post_meta($id, '_service', true);
+    $service_map = [
+        'Tier 1' => 'Recording', 'Recording' => 'Recording',
+        'Tier 2' => 'Mixing', 'Mixing' => 'Mixing',
+        'Tier 3' => 'Mixing + Mastering', 'Mixing + Mastering' => 'Mixing + Mastering',
+        'Tier 4' => 'Full Production', 'Full Production' => 'Full Production',
+        'FOH Engineer' => 'FOH Engineer', 'Monitor Engineer' => 'Monitor Engineer',
+        'Sound Design' => 'Sound Design', 'Consultation' => 'Consultation',
+        'Travel' => 'Travel/Transport', 'Equipment' => 'Equipment Rental',
+    ];
+    $service_type = '';
+    foreach ($service_map as $key => $val) {
+        if (stripos($raw_service, $key) !== false) { $service_type = $val; break; }
+    }
+    $data = [
+        'client_name'  => get_post_meta($id, '_client_name', true) ?: get_the_title($id),
+        'client_email' => get_post_meta($id, '_client_email', true),
+        'client_phone' => get_post_meta($id, '_client_phone', true),
+        'event_date'   => '',
+        'start_time'   => '',
+        'end_time'     => '',
+        'venue'        => get_post_meta($id, '_location', true),
+        'service_type' => $service_type,
+    ];
+
+    // First slot date/time from booking
+    $slots = get_post_meta($id, '_booking_slots', true);
+    if (is_array($slots) && !empty($slots)) {
+        $s = reset($slots);
+        $data['event_date'] = isset($s['date']) ? $s['date'] : '';
+        $data['start_time'] = $s['start'] ?? '';
+        $data['end_time']   = $s['end'] ?? '';
+    }
+
+    wp_send_json_success($data);
+}
+add_action('wp_ajax_studio_invoice_autopopulate_booking', 'studio_ajax_autopopulate_booking');
+
+function studio_ajax_autopopulate_gig() {
+    check_ajax_referer('studio_autopopulate', 'nonce');
+    if (!current_user_can('manage_options')) wp_send_json_error();
+    $id = intval($_POST['id']);
+    wp_send_json_success([
+        'event_date'   => get_post_meta($id, '_gig_date', true),
+        'start_time'   => '',
+        'end_time'     => '',
+        'venue'        => get_post_meta($id, '_gig_venue', true),
+        'service_type' => '',
+    ]);
+}
+add_action('wp_ajax_studio_invoice_autopopulate_gig', 'studio_ajax_autopopulate_gig');
+
+/* ----------------------------------------------
+    INVOICE EMAIL HELPERS
+    ---------------------------------------------- */
+function studio_invoice_email_body($inv_id) {
+    $client_name = get_post_meta($inv_id, '_client_name', true);
+    $total = floatval(get_post_meta($inv_id, '_total', true));
+    $deposit = floatval(get_post_meta($inv_id, '_deposit', true));
+    $due = get_post_meta($inv_id, '_due_date', true);
+    $line_items = get_post_meta($inv_id, '_line_items', true);
+    $event_date = get_post_meta($inv_id, '_event_date', true);
+    $venue = get_post_meta($inv_id, '_venue', true);
+    $service_type = get_post_meta($inv_id, '_service_type', true) ?: get_post_meta($inv_id, '_service', true);
+
+    $body = '<h2>Invoice #' . $inv_id . ' — Roux Audio Production</h2>';
+    if ($event_date) $body .= '<p><strong>Event:</strong> ' . esc_html(date('F j, Y', strtotime($event_date))) . '</p>';
+    if ($venue) $body .= '<p><strong>Venue:</strong> ' . esc_html($venue) . '</p>';
+
+    if (is_array($line_items) && !empty($line_items)) {
+        $body .= '<table style="width:100%;border-collapse:collapse;margin:16px 0;"><tr><th style="text-align:left;border-bottom:2px solid #d4a574;padding:8px;">Description</th><th style="border-bottom:2px solid #d4a574;padding:8px;">Qty</th><th style="border-bottom:2px solid #d4a574;padding:8px;">Rate</th><th style="text-align:right;border-bottom:2px solid #d4a574;padding:8px;">Total</th></tr>';
+        foreach ($line_items as $li) {
+            $qt = floatval($li['qty'] ?? 0);
+            $rt = floatval($li['rate'] ?? 0);
+            $body .= '<tr><td style="padding:6px;">' . esc_html($li['desc'] ?? '') . '</td><td style="padding:6px;">' . $qt . '</td><td style="padding:6px;">$' . number_format($rt, 2) . '</td><td style="text-align:right;padding:6px;">$' . number_format($qt * $rt, 2) . '</td></tr>';
+        }
+        $body .= '</table>';
+    } else {
+        $rate = floatval(get_post_meta($inv_id, '_rate', true));
+        $hours = floatval(get_post_meta($inv_id, '_total_hours', true));
+        if ($service_type) $body .= '<p><strong>Service:</strong> ' . esc_html($service_type) . '</p>';
+        if ($rate && $hours) $body .= '<p>' . esc_html($hours) . ' hours @ $' . number_format($rate, 2) . '/hr = <strong>$' . number_format($rate * $hours, 2) . '</strong></p>';
+    }
+
+    $body .= '<div style="background:rgba(212,165,116,0.1);padding:20px;border-radius:8px;margin:20px 0;">';
+    $body .= '<p><strong>Total:</strong> $' . number_format($total, 2) . '</p>';
+    $body .= '<p><strong>Deposit:</strong> $' . number_format($deposit, 2) . '</p>';
+    if ($due) $body .= '<p><strong>Due Date:</strong> ' . esc_html($due) . '</p>';
+    $body .= '</div>';
+
+    return $body;
+}
+
+/* ----------------------------------------------
+    BOOKING FORM HANDLER
+    ---------------------------------------------- */
 function studio_booking_handler() {
     if (!isset($_SERVER['REQUEST_METHOD']) || $_SERVER['REQUEST_METHOD'] !== 'POST' || !isset($_POST['studio_booking'])) return;
 
@@ -238,20 +434,18 @@ function studio_booking_handler() {
     $slots = [];
     $total_hours = 0;
 
-    if ($is_hourly) {
-        foreach ($slot_dates as $i => $date) {
-            if (empty($date)) continue;
-            $slot = ['date' => $date, 'start' => $slot_starts[$i] ?? '', 'end' => $slot_ends[$i] ?? ''];
-            if ($slot['start'] && $slot['end']) {
-                $sp = explode(':', $slot['start']);
-                $ep = explode(':', $slot['end']);
-                $diff = ($ep[0] * 60 + $ep[1]) - ($sp[0] * 60 + $sp[1]);
-                if ($diff <= 0) continue;
-                $slot['hours'] = round($diff / 60 * 4) / 4;
-                $total_hours += $slot['hours'];
-            }
-            $slots[] = $slot;
+    foreach ($slot_dates as $i => $date) {
+        if (empty($date)) continue;
+        $slot = ['date' => $date, 'start' => $slot_starts[$i] ?? '', 'end' => $slot_ends[$i] ?? ''];
+        if ($slot['start'] && $slot['end']) {
+            $sp = explode(':', $slot['start']);
+            $ep = explode(':', $slot['end']);
+            $diff = ($ep[0] * 60 + $ep[1]) - ($sp[0] * 60 + $sp[1]);
+            if ($diff <= 0) continue;
+            $slot['hours'] = round($diff / 60 * 4) / 4;
+            $total_hours += $slot['hours'];
         }
+        $slots[] = $slot;
     }
 
     $post_id = wp_insert_post([
@@ -316,7 +510,19 @@ function studio_booking_action() {
         if (!wp_verify_nonce($_GET['_wpnonce'] ?? '', 'studio_booking_decline_' . intval($_GET['studio_booking_decline']))) {
             wp_die('Security check failed');
         }
-        update_post_meta(intval($_GET['studio_booking_decline']), '_status', 'Declined');
+        $did = intval($_GET['studio_booking_decline']);
+        update_post_meta($did, '_status', 'Declined');
+
+        $d_name = get_the_title($did);
+        $d_email = get_post_meta($did, '_client_email', true);
+        if ($d_email) {
+            studio_send_email($d_email, "Booking Request Declined",
+                '<p>Hi ' . esc_html($d_name) . ',</p>' .
+                '<p>We regret that we are unable to accommodate your booking request at this time.</p>');
+        }
+        studio_send_email(get_option('admin_email'), "Booking Declined — {$d_name}",
+            '<p>Booking for <strong>' . esc_html($d_name) . '</strong> has been declined.</p>');
+
         wp_redirect(admin_url('edit.php?post_type=studio_booking'));
         exit;
     }
@@ -333,6 +539,8 @@ function studio_counter_offer_meta_callback($post) {
     <p><label>Note to Client: <textarea name="co_message" rows="3" style="width:100%;"><?php echo esc_textarea(get_post_meta($post->ID, '_counter_message', true)); ?></textarea></label></p>
     <?php
     wp_nonce_field('studio_counter_offer', '_co_nonce');
+    echo '<input type="hidden" name="studio_counter_offer" value="1">';
+    submit_button('Send Counter Offer', 'secondary', 'submit_counter', false);
 }
 
 /* ----------------------------------------------
@@ -370,12 +578,106 @@ function studio_invoice_adjustments_callback($post) {
     echo '<p><strong>Deposit:</strong> $' . number_format($deposit, 2) . ($deposit_paid ? ' (Paid)' : ' (Pending)') . '</p>';
     if ($due) echo '<p><strong>Due:</strong> ' . esc_html($due) . '</p>';
     echo '</div>';
+
+    // Line items display
+    $line_items = get_post_meta($post->ID, '_line_items', true);
+    if (is_array($line_items) && !empty($line_items)) {
+        echo '<h3 style="margin-top:16px;">Line Items</h3>';
+        echo '<table class="widefat"><thead><tr><th>Description</th><th>Qty</th><th>Rate</th><th>Total</th></tr></thead><tbody>';
+        foreach ($line_items as $li) {
+            $desc = $li['desc'] ?? '';
+            $qty  = floatval($li['qty'] ?? 0);
+            $rate = floatval($li['rate'] ?? 0);
+            echo '<tr><td>' . esc_html($desc) . '</td><td>' . $qty . '</td><td>$' . number_format($rate, 2) . '</td><td>$' . number_format($qty * $rate, 2) . '</td></tr>';
+        }
+        echo '</tbody></table>';
+    }
+
+    // Gig details display
+    $event_date = get_post_meta($post->ID, '_event_date', true);
+    $venue = get_post_meta($post->ID, '_venue', true);
+    $start_time = get_post_meta($post->ID, '_start_time', true);
+    $end_time = get_post_meta($post->ID, '_end_time', true);
+    if ($event_date || $venue) {
+        echo '<h3 style="margin-top:16px;">Gig / Event Details</h3>';
+        if ($event_date) echo '<p><strong>Date:</strong> ' . esc_html(date('M j, Y', strtotime($event_date))) . '</p>';
+        if ($start_time || $end_time) echo '<p><strong>Time:</strong> ' . esc_html($start_time ?: '—') . ' – ' . esc_html($end_time ?: '—') . '</p>';
+        if ($venue) echo '<p><strong>Venue:</strong> ' . esc_html($venue) . '</p>';
+    }
 }
 function studio_invoice_meta_boxes() {
-    add_meta_box('studio_invoice_adjustments', 'Summary', 'studio_invoice_adjustments_callback', 'studio_invoice', 'normal', 'high');
+    add_meta_box('studio_invoice_summary_display', 'Summary', 'studio_invoice_adjustments_callback', 'studio_invoice', 'normal', 'high');
+    add_meta_box('studio_invoice_gig_details', 'Gig / Event Details', 'studio_invoice_gig_details_meta', 'studio_invoice', 'normal', 'default');
     add_meta_box('studio_invoice_tax', 'Tax Information', 'studio_invoice_tax_meta', 'studio_invoice', 'side', 'default');
+    add_meta_box('studio_invoice_client_info', 'Client Info & Actions', 'studio_invoice_client_info_meta', 'studio_invoice', 'side', 'high');
 }
 add_action('add_meta_boxes', 'studio_invoice_meta_boxes');
+
+// Hero image field for Home page
+function studio_page_meta_boxes() {
+    $screen = get_current_screen();
+    if ($screen && $screen->post_type === 'page') {
+        add_meta_box('studio_hero_image', 'Hero Image', function($post) {
+            wp_nonce_field('studio_save_hero', '_hero_nonce');
+            $url = get_post_meta($post->ID, '_hero_image_url', true);
+            ?>
+            <p>Paste the full URL of the hero background image:</p>
+            <p><input type="url" name="_hero_image_url" value="<?php echo esc_attr($url); ?>" style="width:100%;" placeholder="https://example.com/image.jpg"></p>
+            <?php if ($url) : ?>
+                <p><img src="<?php echo esc_url($url); ?>" style="max-width:100%;height:auto;border-radius:8px;margin-top:8px;"></p>
+            <?php endif; ?>
+            <?php
+        }, 'page', 'side', 'default');
+    }
+}
+add_action('add_meta_boxes', 'studio_page_meta_boxes');
+
+function studio_save_page_meta($post_id) {
+    if (!isset($_POST['_hero_nonce']) || !wp_verify_nonce($_POST['_hero_nonce'], 'studio_save_hero')) return;
+    if (isset($_POST['_hero_image_url'])) update_post_meta($post_id, '_hero_image_url', esc_url_raw($_POST['_hero_image_url']));
+}
+add_action('save_post', 'studio_save_page_meta');
+
+function studio_invoice_client_info_meta($post) {
+    wp_nonce_field('studio_save_invoice', '_studio_invoice_nonce');
+    $client_name = get_post_meta($post->ID, '_client_name', true);
+    $client_email = get_post_meta($post->ID, '_client_email', true);
+    $status = get_post_meta($post->ID, '_status', true) ?: 'Draft';
+
+    echo '<p><label><strong>Client Name:</strong><br><input type="text" name="_client_name" value="' . esc_attr($client_name) . '" style="width:100%;"></label></p>';
+    echo '<p><label><strong>Client Email:</strong><br><input type="email" name="_client_email" value="' . esc_attr($client_email) . '" placeholder="client@example.com" style="width:100%;"></label></p>';
+
+    $actions_html = '<div style="margin-top:12px;">';
+    if ($status === 'Draft') {
+        $nonce = wp_create_nonce('studio_invoice_submit_' . $post->ID);
+        $url = admin_url("admin-post.php?action=studio_invoice_quick_submit&post_id={$post->ID}&_wpnonce=$nonce");
+        $actions_html .= '<a href="' . esc_url($url) . '" class="button button-primary button-hero" style="width:100%;margin-bottom:8px;text-align:center;">Send to Client</a>';
+    }
+    if ($status !== 'Paid') {
+        $nonce = wp_create_nonce('studio_invoice_mark_paid_' . $post->ID);
+        $url = admin_url("admin-post.php?action=studio_invoice_quick_paid&post_id={$post->ID}&_wpnonce=$nonce");
+        $actions_html .= '<a href="' . esc_url($url) . '" class="button button-secondary button-hero" style="width:100%;text-align:center;">Mark Paid</a>';
+    }
+    $actions_html .= '</div>';
+    echo $actions_html;
+}
+
+function studio_invoice_gig_details_meta($post) {
+    $event_date = get_post_meta($post->ID, '_event_date', true);
+    $start_time = get_post_meta($post->ID, '_start_time', true);
+    $end_time = get_post_meta($post->ID, '_end_time', true);
+    $venue = get_post_meta($post->ID, '_venue', true);
+    $service_type = get_post_meta($post->ID, '_service_type', true);
+    $client_phone = get_post_meta($post->ID, '_client_phone', true);
+    ?>
+    <p><label>Event Date: <input type="date" name="_event_date" value="<?php echo esc_attr($event_date); ?>" style="width:100%;"></label></p>
+    <p><label>Start Time: <input type="time" name="_start_time" value="<?php echo esc_attr($start_time); ?>" style="width:100%;"></label></p>
+    <p><label>End Time: <input type="time" name="_end_time" value="<?php echo esc_attr($end_time); ?>" style="width:100%;"></label></p>
+    <p><label>Venue / Location: <input type="text" name="_venue" value="<?php echo esc_attr($venue); ?>" placeholder="Studio or venue address" style="width:100%;"></label></p>
+    <p><label>Service Type: <input type="text" name="_service_type" value="<?php echo esc_attr($service_type); ?>" placeholder="e.g. FOH Engineer, Recording" style="width:100%;"></label></p>
+    <p><label>Client Phone: <input type="tel" name="_client_phone" value="<?php echo esc_attr($client_phone); ?>" placeholder="(555) 555-5555" style="width:100%;"></label></p>
+    <?php
+}
 
 function studio_invoice_tax_meta($post) {
     $tax_rate = get_post_meta($post->ID, '_tax_rate', true) ?: '0';
@@ -390,6 +692,15 @@ function studio_invoice_tax_meta($post) {
 
 function studio_save_invoice_tax_meta($post_id) {
     if (!isset($_POST['_studio_invoice_nonce']) || !wp_verify_nonce($_POST['_studio_invoice_nonce'], 'studio_save_invoice')) return;
+    // Client info
+    if (isset($_POST['_client_name'])) update_post_meta($post_id, '_client_name', sanitize_text_field($_POST['_client_name']));
+    if (isset($_POST['_client_email'])) update_post_meta($post_id, '_client_email', sanitize_email($_POST['_client_email']));
+    // Gig / event details
+    $gig_fields = ['_event_date', '_start_time', '_end_time', '_venue', '_service_type', '_client_phone'];
+    foreach ($gig_fields as $f) {
+        if (isset($_POST[$f])) update_post_meta($post_id, $f, sanitize_text_field($_POST[$f]));
+    }
+    // Tax fields
     if (isset($_POST['_tax_rate'])) update_post_meta($post_id, '_tax_rate', floatval($_POST['_tax_rate']));
     if (isset($_POST['_tax_collected'])) update_post_meta($post_id, '_tax_collected', floatval($_POST['_tax_collected']));
     if (isset($_POST['_tax_jurisdiction'])) update_post_meta($post_id, '_tax_jurisdiction', sanitize_text_field($_POST['_tax_jurisdiction']));
@@ -411,6 +722,7 @@ add_action('init', 'studio_expense_cpt');
 
 function studio_expense_meta_boxes() {
     add_meta_box('studio_expense_details', 'Expense Details', function($post) {
+        wp_nonce_field('studio_save_expense', '_studio_expense_nonce');
         $cats = ['Equipment', 'Software', 'Travel', 'Venue', 'Marketing', 'Supplies', 'Utilities', 'Maintenance', 'Other'];
         $current = get_post_meta($post->ID, '_expense_category', true);
         $tax_cats = ['Operating Expense', 'Capital Expenditure', 'Home Office', 'Vehicle', 'Professional Development', 'Insurance', 'Not Deductible'];
@@ -468,6 +780,7 @@ add_action('init', 'studio_gig_cpt');
 
 function studio_gig_meta_boxes() {
     add_meta_box('studio_gig_details', 'Gig Details', function($post) {
+        wp_nonce_field('studio_save_gig', '_studio_gig_nonce');
         ?>
         <p><label>Date: <input type="date" name="_gig_date" value="<?php echo esc_attr(get_post_meta($post->ID, '_gig_date', true)); ?>" style="width:100%;"></label></p>
         <p><label>Venue: <input type="text" name="_gig_venue" value="<?php echo esc_attr(get_post_meta($post->ID, '_gig_venue', true)); ?>" style="width:100%;"></label></p>
@@ -504,6 +817,7 @@ add_action('init', 'studio_promo_cpt');
 
 function studio_promo_meta_boxes() {
     add_meta_box('studio_promo_details', 'Promotion Details', function($post) {
+        wp_nonce_field('studio_save_promo', '_studio_promo_nonce');
         ?>
         <p><label>Discount: <input type="text" name="_promo_discount" value="<?php echo esc_attr(get_post_meta($post->ID, '_promo_discount', true)); ?>" placeholder="e.g. 20%" style="width:100%;"></label></p>
         <p><label>Promo Code: <input type="text" name="_promo_code" value="<?php echo esc_attr(get_post_meta($post->ID, '_promo_code', true)); ?>" style="width:100%;"></label></p>
@@ -534,20 +848,20 @@ function studio_booking_cpt() {
 add_action('init', 'studio_booking_cpt');
 
 function studio_booking_actions_meta_callback($post) {
-    $status = get_post_meta($post->ID, '_status', true) ?: 'Pending';
+    if (!current_user_can('manage_options')) return;
+    $status = get_post_meta($post->ID, '_status', true) ?: 'New';
     echo '<p><strong>Status:</strong> ' . esc_html($status) . '</p>';
-    if ($status === 'Pending') {
-        $token = get_post_meta($post->ID, '_access_token', true);
-        $approve_url = wp_nonce_url(
-            add_query_arg(['studio_booking_approve' => $post->ID, '_token' => $token], home_url('/')),
-            'studio_booking_action_' . $post->ID
-        );
-        $decline_url = wp_nonce_url(
-            add_query_arg(['studio_booking_decline' => $post->ID, '_token' => $token], home_url('/')),
-            'studio_booking_action_' . $post->ID
-        );
+    if ($status === 'New' || $status === 'Pending') {
+        $approve_nonce = wp_create_nonce('studio_booking_approve_' . $post->ID);
+        $decline_nonce = wp_create_nonce('studio_booking_decline_' . $post->ID);
+        $approve_url = admin_url("admin-post.php?action=studio_booking_quick_approve&post_id={$post->ID}&_wpnonce={$approve_nonce}");
+        $decline_url = admin_url("admin-post.php?action=studio_booking_quick_decline&post_id={$post->ID}&_wpnonce={$decline_nonce}");
         echo '<p><a href="' . esc_url($approve_url) . '" class="button button-primary" style="width:100%;text-align:center;">Approve</a></p>';
         echo '<p><a href="' . esc_url($decline_url) . '" class="button" style="width:100%;text-align:center;">Decline</a></p>';
+    } elseif (in_array($status, ['Approved', 'Declined'])) {
+        $reset_nonce = wp_create_nonce('studio_booking_reset_' . $post->ID);
+        $reset_url = admin_url("admin-post.php?action=studio_booking_reset&post_id={$post->ID}&_wpnonce=$reset_nonce");
+        echo '<p><a href="' . esc_url($reset_url) . '" class="button" style="width:100%;text-align:center;">Reset to Pending</a></p>';
     }
 }
 
@@ -563,11 +877,10 @@ add_action('add_meta_boxes', 'studio_booking_meta_boxes');
 function studio_equipment_cpt() {
     register_post_type('studio_equipment', [
         'labels' => ['name' => 'Equipment', 'singular_name' => 'Equipment', 'menu_name' => 'Equipment', 'add_new_item' => 'Add Equipment'],
-        'public' => true, 'show_ui' => true, 'show_in_menu' => true,
+        'public' => false, 'show_ui' => true, 'show_in_menu' => true,
         'menu_icon' => 'dashicons-slides',
         'supports' => ['title', 'editor', 'thumbnail'],
-        'has_archive' => true,
-        'rewrite' => ['slug' => 'equipment'],
+        'has_archive' => false,
     ]);
 
     register_taxonomy('equipment_category', 'studio_equipment', [
@@ -579,9 +892,22 @@ function studio_equipment_cpt() {
     ]);
 }
 add_action('init', 'studio_equipment_cpt');
+// Flush rewrite rules once then auto-remove (fixes /equipment/ collision)
+function studio_flush_rewrite_equipment() {
+    if ('1' === get_option('studio_rewrite_flush_done')) return;
+    flush_rewrite_rules();
+    update_option('siteurl', get_option('siteurl')); // mark done via separate hook below
+}
+add_action('after_setup_theme', 'studio_flush_rewrite_equipment');
+
+function studio_mark_rewrite_flush_done() {
+    update_option('studio_rewrite_flush_done', '1');
+}
+add_action('shutdown', 'studio_mark_rewrite_flush_done');
 
 function studio_equipment_meta_boxes() {
     add_meta_box('studio_equipment_details', 'Equipment Details', function($post) {
+        wp_nonce_field('studio_save_equipment', '_studio_equipment_nonce');
         $cond = get_post_meta($post->ID, '_condition', true);
         $conds = ['Excellent', 'Good', 'Fair', 'Poor', 'Needs Repair'];
         ?>
@@ -633,21 +959,25 @@ add_action('save_post_studio_equipment', 'studio_save_equipment_meta');
    COUNTER-OFFER HANDLER
    ---------------------------------------------- */
 function studio_counter_offer_handler() {
-    if (!current_user_can('manage_options')) return;
-    if (!isset($_POST['studio_counter_offer']) || !wp_verify_nonce($_POST['_co_nonce'] ?? '', 'studio_counter_offer')) return;
+	if (!current_user_can('manage_options')) return;
+	if (!isset($_POST['studio_counter_offer']) || !wp_verify_nonce($_POST['_co_nonce'] ?? '', 'studio_counter_offer')) return;
 
-    $booking_id = intval($_POST['booking_id']);
-    $new_rate = floatval($_POST['new_rate']);
-    $new_hours = floatval($_POST['new_hours']);
-    $message = sanitize_textarea_field($_POST['co_message'] ?? '');
+	$booking_id = intval($_POST['booking_id']);
+	if (!$booking_id) return;
 
-    update_post_meta($booking_id, '_status', 'Counter-Offer');
-    update_post_meta($booking_id, '_counter_rate', $new_rate);
-    update_post_meta($booking_id, '_counter_hours', $new_hours);
-    update_post_meta($booking_id, '_counter_message', $message);
+	$new_rate   = floatval($_POST['co_rate'] ?? 0);
+	$new_hours  = floatval($_POST['co_hours'] ?? get_post_meta($booking_id, '_total_hours', true));
+	$message    = sanitize_textarea_field($_POST['co_message'] ?? '');
 
-    $client_email = get_post_meta($booking_id, '_client_email', true);
-    $name = get_the_title($booking_id);
+	update_post_meta($booking_id, '_status', 'Counter-Offer');
+	update_post_meta($booking_id, '_counter_rate', $new_rate);
+	update_post_meta($booking_id, '_counter_hours', $new_hours);
+	update_post_meta($booking_id, '_counter_message', $message);
+
+	studio_cache_flush('studio_dashboard_overview');
+
+	$client_email = get_post_meta($booking_id, '_client_email', true);
+	$name = get_the_title($booking_id);
     $token = get_post_meta($booking_id, '_access_token', true) ?: studio_generate_token($booking_id);
 
     if ($client_email) {
@@ -660,6 +990,9 @@ function studio_counter_offer_handler() {
             ($message ? '<p><strong>Note:</strong> ' . esc_html($message) . '</p>' : '') .
             '<p><a href="' . $accept_url . '" style="display:inline-block;padding:12px 32px;background:#d4a574;color:#0a0a0a;text-decoration:none;border-radius:8px;font-weight:bold;">Accept Counter Offer</a></p>' .
             '<p style="margin-top:12px;"><a href="' . $decline_url . '" style="color:#888;">Decline Counter Offer</a></p>');
+
+        studio_send_email(get_option('admin_email'), "Counter Offer Sent — Booking #{$booking_id}",
+            '<p>Counter offer for <strong>' . esc_html($name) . '</strong>: $' . number_format($new_rate, 2) . '/hr × ' . $new_hours . ' hrs.</p>');
     }
     wp_redirect(admin_url('edit.php?post_type=studio_booking'));
     exit;
@@ -678,13 +1011,21 @@ function studio_booking_action_handler() {
         $token = sanitize_text_field($_GET['token'] ?? '');
         if ($invoice_id && $token) {
             $booking_id = intval(get_post_meta($invoice_id, '_booking_id', true));
-            if (!studio_verify_token($booking_id, $token)) {
+            $valid = false;
+            if ($booking_id) {
+                $valid = studio_verify_token($booking_id, $token);
+            }
+            if (!$valid) {
+                $valid = studio_verify_token($invoice_id, $token);
+            }
+            if (!$valid) {
                 wp_die('Invalid or expired access token.');
             }
             $deposit = get_post_meta($invoice_id, '_deposit', true);
             $total = get_post_meta($invoice_id, '_total', true);
             $amount = floatval($deposit ?: floatval($total) * 0.5);
-            wp_redirect("https://www.paypal.com/paypalme/Jesseroux87/{$amount}USD");
+            $redirect = "https://www.paypal.com/cgi-bin/webscr?cmd=_xclick&business=jesseroux87@gmail.com&amount={$amount}&no_note=1&currency_code=USD";
+            wp_redirect($redirect);
             exit;
         }
     }
@@ -707,6 +1048,15 @@ function studio_booking_action_handler() {
         $token = sanitize_text_field($_GET['token'] ?? '');
         if ($booking_id && studio_verify_token($booking_id, $token)) {
             update_post_meta($booking_id, '_status', 'Declined');
+            $name = get_the_title($booking_id);
+            $email = get_post_meta($booking_id, '_client_email', true);
+            if ($email) {
+                studio_send_email($email, "Counter Offer Declined",
+                    '<p>Hi ' . esc_html($name) . ',</p>' .
+                    '<p>We were unable to reach an agreement on the counter offer. Your booking request has been declined.</p>');
+            }
+            studio_send_email(get_option('admin_email'), "Counter Offer Declined — " . esc_html($name),
+                '<p>The counter offer for <strong>' . esc_html($name) . '</strong> has been declined by the client.</p>');
             wp_redirect(home_url('/booking/?booking=sent'));
             exit;
         }
@@ -736,6 +1086,8 @@ function studio_do_approve($post_id, $discount = 0, $discount_type = 'percent', 
         if (!$rate_info['hourly'] && $rate > 0) $total_hours = 1;
         if ($rate === 0) $total_hours = 0;
     }
+
+    update_post_meta($post_id, '_rate', $rate);
 
     $subtotal = $rate * $total_hours;
     $discount_amount = 0;
@@ -772,6 +1124,26 @@ function studio_do_approve($post_id, $discount = 0, $discount_type = 'percent', 
         update_post_meta($post_id, '_invoice_id', $invoice_id);
     }
 
+    // Auto-create gig from booking
+    $slots = get_post_meta($post_id, '_booking_slots', true);
+    $location = get_post_meta($post_id, '_location', true);
+    if (is_array($slots) && !empty($slots[0])) {
+        $first = $slots[0];
+        $gig_title = $service . ' — ' . $name;
+        $gig_id = wp_insert_post([
+            'post_type'   => 'studio_gig',
+            'post_title'  => $gig_title,
+            'post_status' => 'publish',
+        ]);
+        if ($gig_id) {
+            update_post_meta($gig_id, '_gig_date', $first['date'] ?? '');
+            update_post_meta($gig_id, '_gig_venue', $location);
+            update_post_meta($gig_id, '_gig_time', ($first['start'] ?? '') . '–' . ($first['end'] ?? ''));
+            update_post_meta($gig_id, '_booking_id', $post_id);
+            update_post_meta($post_id, '_gig_id', $gig_id);
+        }
+    }
+
     if ($client_email) {
         $deposit_url = home_url("/booking-action/?action=pay_deposit&invoice_id=$invoice_id&token=$token");
         $slots = get_post_meta($post_id, '_booking_slots', true);
@@ -795,14 +1167,18 @@ function studio_do_approve($post_id, $discount = 0, $discount_type = 'percent', 
             '<p>Great news, ' . esc_html($name) . '! Your booking for <strong>' . esc_html($service) . '</strong> has been approved.</p>' .
             '<p><strong>Total:</strong> $' . number_format($total, 2) . '</p>' .
             '<p><strong>50% Deposit Required:</strong> $' . number_format($deposit, 2) . '</p>' .
-            '<p><a href="' . $deposit_url . '" style="display:inline-block;padding:12px 32px;background:#d4a574;color:#0a0a0a;text-decoration:none;border-radius:8px;font-weight:bold;">Pay Deposit via PayPal</a></p>' .
+        '<p><a href="' . $deposit_url . '" style="display:inline-block;padding:12px 32px;background:#d4a574;color:#0a0a0a;text-decoration:none;border-radius:8px;font-weight:bold;">Pay Deposit via PayPal</a></p>' .
             $calendar_section);
+
+        studio_send_email(get_option('admin_email'), "Booking Approved — {$name}",
+            '<p>Booking for <strong>' . esc_html($name) . '</strong> (<strong>' . esc_html($service) . '</strong>) has been approved.</p>' .
+            '<p><strong>Total:</strong> $' . number_format($total, 2) . ' | <strong>Deposit:</strong> $' . number_format($deposit, 2) . '</p>');
     }
 }
 
 /* ----------------------------------------------
-   PERFORMANCE: Transient cache helper
-   ---------------------------------------------- */
+    PERFORMANCE: Transient cache helper
+    ---------------------------------------------- */
 function studio_cache_get($key, $ttl = 300) {
     $cached = get_transient($key);
     if ($cached !== false) return $cached;
@@ -1005,9 +1381,10 @@ function studio_dashboard_overview_callback() {
     $month_start = date('Y-m-01');
     $month_end = date('Y-m-t');
 
+    // N+1 fix: bulk meta queries with get_post_meta() called once per post via object cache
     $revenue = 0;
-    $month_invoices = get_posts(['post_type' => 'studio_invoice', 'post_status' => 'publish', 'numberposts' => -1, 'date_query' => [['after' => $month_start, 'before' => $month_end, 'inclusive' => true]], 'fields' => 'ids']);
-    foreach ($month_invoices as $inv_id) { if (get_post_meta($inv_id, '_deposit_paid', true)) { $revenue += floatval(get_post_meta($inv_id, '_total', true)); } }
+    $paid_invoices = get_posts(['post_type' => 'studio_invoice', 'post_status' => 'publish', 'numberposts' => -1, 'date_query' => [['after' => $month_start, 'before' => $month_end, 'inclusive' => true]], 'meta_key' => '_deposit_paid', 'meta_value' => 1, 'fields' => 'ids']);
+    foreach ($paid_invoices as $inv_id) { $revenue += floatval(get_post_meta($inv_id, '_total', true)); }
 
     $exp = 0;
     $month_expenses = get_posts(['post_type' => 'studio_expense', 'post_status' => 'publish', 'numberposts' => -1, 'date_query' => [['after' => $month_start, 'before' => $month_end, 'inclusive' => true]], 'fields' => 'ids']);
@@ -1206,13 +1583,340 @@ function studio_equipment_column_data($column, $post_id) {
 add_action('manage_studio_equipment_posts_custom_column', 'studio_equipment_column_data', 10, 2);
 
 /* ----------------------------------------------
+   ROW ACTIONS — BOOKINGS (inline Approve/Decline)
+   ---------------------------------------------- */
+function studio_booking_row_actions($actions, $post) {
+    if (!current_user_can('manage_options')) return $actions;
+    $status = get_post_meta($post->ID, '_status', true) ?: 'New';
+
+    unset($actions['inline hide-if-no-js']);
+
+    if ($status === 'Pending' || $status === 'New') {
+        $approve_nonce = wp_create_nonce('studio_booking_approve_' . $post->ID);
+        $approve_url = admin_url("admin-post.php?action=studio_booking_quick_approve&post_id={$post->ID}&_wpnonce=$approve_nonce");
+        $actions['quick_approve'] = '<a href="' . esc_url($approve_url) . '" style="color:#46b450;font-weight:600;">Approve</a>';
+
+        $decline_nonce = wp_create_nonce('studio_booking_decline_' . $post->ID);
+        $decline_url = admin_url("admin-post.php?action=studio_booking_quick_decline&post_id={$post->ID}&_wpnonce=$decline_nonce");
+        $actions['quick_decline'] = '<a href="' . esc_url($decline_url) . '" style="color:#cf2e5e;font-weight:600;">Decline</a>';
+    }
+
+    if ($status === 'Approved') {
+        $invoice_id = get_post_meta($post->ID, '_invoice_id', true);
+        if ($invoice_id && get_post($invoice_id)) {
+            $actions['view_invoice'] = '<a href="' . get_edit_post_link($invoice_id) . '" style="font-weight:600;">View Invoice</a>';
+        }
+        $reset_nonce = wp_create_nonce('studio_booking_reset_' . $post->ID);
+        $reset_url = admin_url("admin-post.php?action=studio_booking_reset&post_id={$post->ID}&_wpnonce=$reset_nonce");
+        $actions['reset_approved'] = '<a href="' . esc_url($reset_url) . '" style="color:#dba617;font-weight:600;">Reset to Pending</a>';
+    }
+
+    if ($status === 'Declined') {
+        $reset_nonce = wp_create_nonce('studio_booking_reset_' . $post->ID);
+        $reset_url = admin_url("admin-post.php?action=studio_booking_reset&post_id={$post->ID}&_wpnonce=$reset_nonce");
+        $actions['reset_declined'] = '<a href="' . esc_url($reset_url) . '" style="color:#dba617;font-weight:600;">Reset to Pending</a>';
+    }
+
+    return $actions;
+}
+add_filter('post_row_actions', 'studio_booking_row_actions', 10, 2);
+
+function studio_booking_quick_approve_handler() {
+    if (!current_user_can('manage_options')) wp_die('Unauthorized');
+    $post_id = intval($_GET['post_id'] ?? 0);
+    if (!isset($_GET['_wpnonce']) || !wp_verify_nonce(sanitize_text_field($_GET['_wpnonce']), 'studio_booking_approve_' . $post_id)) wp_die('Invalid nonce');
+    studio_do_approve($post_id, 0, 'percent');
+    wp_redirect(admin_url("edit.php?post_type=studio_booking&quick_approved=$post_id"));
+    exit;
+}
+add_action('admin_post_studio_booking_quick_approve', 'studio_booking_quick_approve_handler');
+
+function studio_booking_quick_decline_handler() {
+    if (!current_user_can('manage_options')) wp_die('Unauthorized');
+    $post_id = intval($_GET['post_id'] ?? 0);
+    if (!isset($_GET['_wpnonce']) || !wp_verify_nonce(sanitize_text_field($_GET['_wpnonce']), 'studio_booking_decline_' . $post_id)) wp_die('Invalid nonce');
+    update_post_meta($post_id, '_status', 'Declined');
+    studio_cache_flush('studio_dashboard_overview');
+
+    $name = get_the_title($post_id);
+    $email = get_post_meta($post_id, '_client_email', true);
+    if ($email) {
+        studio_send_email($email, "Booking Request Declined",
+            '<p>Hi ' . esc_html($name) . ',</p>' .
+            '<p>We regret that we are unable to accommodate your booking request at this time.</p>');
+    }
+    studio_send_email(get_option('admin_email'), "Booking Declined — " . esc_html($name),
+        '<p>Booking for <strong>' . esc_html($name) . '</strong> has been declined.</p>');
+
+    wp_redirect(admin_url("edit.php?post_type=studio_booking&quick_declined=$post_id"));
+    exit;
+}
+add_action('admin_post_studio_booking_quick_decline', 'studio_booking_quick_decline_handler');
+
+function studio_booking_reset_handler() {
+    if (!current_user_can('manage_options')) wp_die('Unauthorized');
+    $post_id = intval($_GET['post_id'] ?? 0);
+    if (!isset($_GET['_wpnonce']) || !wp_verify_nonce(sanitize_text_field($_GET['_wpnonce']), 'studio_booking_reset_' . $post_id)) wp_die('Invalid nonce');
+    update_post_meta($post_id, '_status', 'Pending');
+    studio_cache_flush('studio_dashboard_overview');
+    wp_redirect(admin_url("edit.php?post_type=studio_booking&booking_reset=$post_id"));
+    exit;
+}
+add_action('admin_post_studio_booking_reset', 'studio_booking_reset_handler');
+
+function studio_quick_action_notices() {
+    $screen = get_current_screen();
+    if ($screen && isset($_GET['quick_approved'])) {
+        echo '<div class="notice notice-success is-dismissible"><p>Booking approved.</p></div>';
+    }
+    if ($screen && isset($_GET['quick_declined'])) {
+        echo '<div class="notice notice-warning is-dismissible"><p>Booking declined.</p></div>';
+    }
+    if ($screen && isset($_GET['booking_reset'])) {
+        echo '<div class="notice notice-info is-dismissible"><p>Booking reset to pending — you can approve or decline it again.</p></div>';
+    }
+}
+add_action('admin_notices', 'studio_quick_action_notices');
+
+/* ----------------------------------------------
+   ROW ACTIONS — INVOICES (Submit / Mark Paid) + Bulk
+   ---------------------------------------------- */
+function studio_invoice_row_actions($actions, $post) {
+    if (!current_user_can('manage_options')) return $actions;
+    $status = get_post_meta($post->ID, '_status', true) ?: 'Draft';
+
+    unset($actions['inline hide-if-no-js']);
+
+    if ($status === 'Draft') {
+        $submit_nonce = wp_create_nonce('studio_invoice_submit_' . $post->ID);
+        $submit_url = admin_url("admin-post.php?action=studio_invoice_quick_submit&post_id={$post->ID}&_wpnonce=$submit_nonce");
+        $actions['quick_submit'] = '<a href="' . esc_url($submit_url) . '" style="color:#46b450;font-weight:600;">Submit to Client</a>';
+    }
+
+    if ($status === 'Sent' || $status === 'Draft') {
+        $paid_nonce = wp_create_nonce('studio_invoice_mark_paid_' . $post->ID);
+        $paid_url = admin_url("admin-post.php?action=studio_invoice_quick_paid&post_id={$post->ID}&_wpnonce=$paid_nonce");
+        $actions['quick_paid'] = '<a href="' . esc_url($paid_url) . '" style="color:#2271b1;font-weight:600;">Mark Paid</a>';
+    }
+
+    return $actions;
+}
+add_filter('post_row_actions', 'studio_invoice_row_actions', 10, 2);
+
+function studio_invoice_quick_submit_handler() {
+    if (!current_user_can('manage_options')) wp_die('Unauthorized');
+    $post_id = intval($_GET['post_id'] ?? 0);
+    if (!isset($_GET['_wpnonce']) || !wp_verify_nonce(sanitize_text_field($_GET['_wpnonce']), 'studio_invoice_submit_' . $post_id)) wp_die('Invalid nonce');
+    update_post_meta($post_id, '_status', 'Sent');
+    studio_cache_flush('studio_dashboard_overview');
+
+    $client_email = get_post_meta($post_id, '_client_email', true);
+    $client_name = get_post_meta($post_id, '_client_name', true);
+    $total = floatval(get_post_meta($post_id, '_total', true));
+    if ($client_email && $total > 0) {
+        $token = studio_generate_token($post_id);
+        $pay_url = home_url("/booking-action/?action=pay_deposit&invoice_id=$post_id&token=$token");
+        studio_send_email($client_email, "Invoice #{$post_id} — Roux Audio Production",
+            '<p>Hi ' . esc_html($client_name) . ',</p>' .
+            '<p>Your invoice is ready.</p>' .
+            studio_invoice_email_body($post_id) .
+            '<p><a href="' . $pay_url . '" style="display:inline-block;padding:12px 32px;background:#d4a574;color:#0a0a0a;text-decoration:none;border-radius:8px;font-weight:bold;">Pay Now</a></p>');
+        studio_send_email(get_option('admin_email'), "Invoice #{$post_id} Sent — " . esc_html($client_name),
+            '<p>Invoice #' . $post_id . ' for <strong>' . esc_html($client_name) . '</strong> has been sent to ' . esc_html($client_email) . '.</p>');
+    }
+    wp_redirect(admin_url("edit.php?post_type=studio_invoice&invoice_submitted=$post_id"));
+    exit;
+}
+add_action('admin_post_studio_invoice_quick_submit', 'studio_invoice_quick_submit_handler');
+
+function studio_invoice_quick_paid_handler() {
+    if (!current_user_can('manage_options')) wp_die('Unauthorized');
+    $post_id = intval($_GET['post_id'] ?? 0);
+    if (!isset($_GET['_wpnonce']) || !wp_verify_nonce(sanitize_text_field($_GET['_wpnonce']), 'studio_invoice_mark_paid_' . $post_id)) wp_die('Invalid nonce');
+    update_post_meta($post_id, '_status', 'Paid');
+    update_post_meta($post_id, '_paid_date', current_time('mysql'));
+    update_post_meta($post_id, '_deposit_paid', '1');
+    studio_cache_flush('studio_dashboard_overview');
+
+    $booking_id = intval(get_post_meta($post_id, '_booking_id', true));
+    if ($booking_id) update_post_meta($booking_id, '_deposit_paid', '1');
+
+    $client_email = get_post_meta($post_id, '_client_email', true);
+    $client_name = get_post_meta($post_id, '_client_name', true);
+    if ($client_email) {
+        studio_send_email($client_email, "Payment Received — Invoice #{$post_id}",
+            '<p>Hi ' . esc_html($client_name) . ',</p>' .
+            '<p>Your payment for <strong>Invoice #' . $post_id . '</strong> has been received. Thank you!</p>');
+    }
+    studio_send_email(get_option('admin_email'), "Payment Received — Invoice #{$post_id}",
+        '<p>Invoice #' . $post_id . ' for <strong>' . esc_html($client_name) . '</strong> marked as paid.</p>');
+
+    wp_redirect(admin_url("edit.php?post_type=studio_invoice&invoice_paid=$post_id"));
+    exit;
+}
+add_action('admin_post_studio_invoice_quick_paid', 'studio_invoice_quick_paid_handler');
+
+function studio_invoice_bulk_actions($actions) {
+    $actions['studio_bulk_submit'] = 'Submit to Client';
+    $actions['studio_bulk_mark_paid'] = 'Mark Paid';
+    return $actions;
+}
+add_filter('bulk_actions-edit-studio_invoice', 'studio_invoice_bulk_actions');
+
+function studio_invoice_bulk_handler($redirect_to, $doaction, $post_ids) {
+    if (!current_user_can('manage_options')) return $redirect_to;
+    if ($doaction === 'studio_bulk_submit') {
+        foreach ($post_ids as $id) {
+            update_post_meta($id, '_status', 'Sent');
+            $ce = get_post_meta($id, '_client_email', true);
+            $cn = get_post_meta($id, '_client_name', true);
+            if ($ce) {
+                $token = studio_generate_token($id);
+                $pay_url = home_url("/booking-action/?action=pay_deposit&invoice_id=$id&token=$token");
+                studio_send_email($ce, "Invoice #{$id} — Roux Audio Production",
+                    '<p>Hi ' . esc_html($cn) . ',</p><p>Your invoice is ready.</p>' .
+                    studio_invoice_email_body($id) .
+                    '<p><a href="' . $pay_url . '" style="display:inline-block;padding:12px 32px;background:#d4a574;color:#0a0a0a;text-decoration:none;border-radius:8px;font-weight:bold;">Pay Now</a></p>');
+            }
+            studio_send_email(get_option('admin_email'), "Invoice #{$id} Sent — " . esc_html($cn),
+                '<p>Invoice #' . $id . ' for <strong>' . esc_html($cn) . '</strong> has been sent to ' . esc_html($ce) . '.</p>');
+        }
+        studio_cache_flush('studio_dashboard_overview');
+        return add_query_arg('invoices_submitted', count($post_ids), $redirect_to);
+    }
+    if ($doaction === 'studio_bulk_mark_paid') {
+        foreach ($post_ids as $id) {
+            update_post_meta($id, '_status', 'Paid');
+            update_post_meta($id, '_paid_date', current_time('mysql'));
+            update_post_meta($id, '_deposit_paid', '1');
+            $booking_id = intval(get_post_meta($id, '_booking_id', true));
+            if ($booking_id) update_post_meta($booking_id, '_deposit_paid', '1');
+            $ce = get_post_meta($id, '_client_email', true);
+            $cn = get_post_meta($id, '_client_name', true);
+            if ($ce) {
+                studio_send_email($ce, "Payment Received — Invoice #{$id}",
+                    '<p>Hi ' . esc_html($cn) . ',</p><p>Your payment for <strong>Invoice #' . $id . '</strong> has been received. Thank you!</p>');
+            }
+            studio_send_email(get_option('admin_email'), "Payment Received — Invoice #{$id}",
+                '<p>Invoice #' . $id . ' for <strong>' . esc_html($cn) . '</strong> has been marked as paid.</p>');
+        }
+        studio_cache_flush('studio_dashboard_overview');
+        return add_query_arg('invoices_paid', count($post_ids), $redirect_to);
+    }
+    return $redirect_to;
+}
+add_filter('handle_bulk_actions-edit-studio_invoice', 'studio_invoice_bulk_handler', 10, 3);
+
+function studio_invoice_notices() {
+    if (isset($_GET['invoice_submitted'])) echo '<div class="notice notice-success is-dismissible"><p>Invoice submitted to client.</p></div>';
+    if (isset($_GET['invoice_paid'])) echo '<div class="notice notice-success is-dismissible"><p>Invoice marked as paid.</p></div>';
+    if (isset($_GET['invoices_submitted'])) echo '<div class="notice notice-success is-dismissible"><p>' . intval($_GET['invoices_submitted']) . ' invoice(s) submitted.</p></div>';
+    if (isset($_GET['invoices_paid'])) echo '<div class="notice notice-success is-dismissible"><p>' . intval($_GET['invoices_paid']) . ' invoice(s) marked paid.</p></div>';
+}
+add_action('admin_notices', 'studio_invoice_notices');
+
+/* ----------------------------------------------
+   ADMIN COLUMNS + ROW ACTIONS — EXPENSES
+   ---------------------------------------------- */
+function studio_expense_columns($columns) {
+    $new = [];
+    foreach ($columns as $k => $v) {
+        $new[$k] = $v;
+        if ($k === 'title') {
+            $new['exp_amount'] = 'Amount';
+            $new['exp_date'] = 'Date';
+            $new['exp_category'] = 'Category';
+            $new['exp_tax_cat'] = 'Tax Category';
+            $new['exp_deductible'] = 'Deductible';
+        }
+    }
+    return $new;
+}
+add_filter('manage_studio_expense_posts_columns', 'studio_expense_columns');
+
+function studio_expense_column_data($column, $post_id) {
+    switch ($column) {
+        case 'exp_amount':
+            $amt = floatval(get_post_meta($post_id, '_expense_amount', true));
+            echo $amt ? '$' . number_format($amt, 2) : '-';
+            break;
+        case 'exp_date':
+            echo esc_html(get_post_meta($post_id, '_expense_date', true));
+            break;
+        case 'exp_category':
+            echo esc_html(get_post_meta($post_id, '_expense_category', true));
+            break;
+        case 'exp_tax_cat':
+            $tc = get_post_meta($post_id, '_tax_category', true);
+            echo $tc ? studio_badge_html($tc) : '-';
+            break;
+        case 'exp_deductible':
+            echo get_post_meta($post_id, '_tax_deductible', true) ? '<span style="color:#46b450;font-weight:600;">Yes</span>' : '<span style="color:#888;">No</span>';
+            break;
+    }
+}
+add_action('manage_studio_expense_posts_custom_column', 'studio_expense_column_data', 10, 2);
+
+function studio_expense_row_actions($actions, $post) {
+    if (!current_user_can('manage_options')) return $actions;
+    $status = get_post_meta($post->ID, '_expense_status', true) ?: 'Draft';
+
+    unset($actions['inline hide-if-no-js']);
+
+    if ($status === 'Draft' || $status === '') {
+        $submit_nonce = wp_create_nonce('studio_expense_submit_' . $post->ID);
+        $submit_url = admin_url("admin-post.php?action=studio_expense_quick_submit&post_id={$post->ID}&_wpnonce=$submit_nonce");
+        $actions['quick_submit'] = '<a href="' . esc_url($submit_url) . '" style="color:#46b450;font-weight:600;">Submit</a>';
+    }
+
+    return $actions;
+}
+add_filter('post_row_actions', 'studio_expense_row_actions', 10, 2);
+
+function studio_expense_quick_submit_handler() {
+    if (!current_user_can('manage_options')) wp_die('Unauthorized');
+    $post_id = intval($_GET['post_id'] ?? 0);
+    if (!isset($_GET['_wpnonce']) || !wp_verify_nonce(sanitize_text_field($_GET['_wpnonce']), 'studio_expense_submit_' . $post_id)) wp_die('Invalid nonce');
+    update_post_meta($post_id, '_expense_status', 'Approved');
+    studio_cache_flush('studio_dashboard_overview');
+    wp_redirect(admin_url("edit.php?post_type=studio_expense&expense_submitted=$post_id"));
+    exit;
+}
+add_action('admin_post_studio_expense_quick_submit', 'studio_expense_quick_submit_handler');
+
+function studio_expense_bulk_actions($actions) {
+    $actions['studio_bulk_expense_submit'] = 'Submit';
+    return $actions;
+}
+add_filter('bulk_actions-edit-studio_expense', 'studio_expense_bulk_actions');
+
+function studio_expense_bulk_handler($redirect_to, $doaction, $post_ids) {
+    if (!current_user_can('manage_options')) return $redirect_to;
+    if ($doaction === 'studio_bulk_expense_submit') {
+        foreach ($post_ids as $id) {
+            update_post_meta($id, '_expense_status', 'Approved');
+        }
+        studio_cache_flush('studio_dashboard_overview');
+        return add_query_arg('expenses_submitted', count($post_ids), $redirect_to);
+    }
+    return $redirect_to;
+}
+add_filter('handle_bulk_actions-edit-studio_expense', 'studio_expense_bulk_handler', 10, 3);
+
+function studio_expense_notices() {
+    if (isset($_GET['expense_submitted'])) echo '<div class="notice notice-success is-dismissible"><p>Expense submitted.</p></div>';
+    if (isset($_GET['expenses_submitted'])) echo '<div class="notice notice-success is-dismissible"><p>' . intval($_GET['expenses_submitted']) . ' expense(s) submitted.</p></div>';
+}
+add_action('admin_notices', 'studio_expense_notices');
+
+/* ----------------------------------------------
    iCal EXPORT (require login or admin)
    ---------------------------------------------- */
-function studio_ical_export() {
-    if (!isset($_GET['ical'])) return;
-    if (!is_user_logged_in()) {
-        wp_die('You must be logged in to export calendar data.');
-    }
+ function studio_ical_export() {
+     if (!isset($_GET['ical'])) return;
+     if (!current_user_can('manage_options')) {
+         wp_die('Access denied.');
+     }
     $type = sanitize_text_field($_GET['ical']);
 
     header('Content-Type: text/calendar; charset=utf-8');
@@ -1250,6 +1954,7 @@ add_action('init', 'studio_ical_export');
    SHORTCODES
    ---------------------------------------------- */
 function studio_pnl_shortcode($atts) {
+    if (!current_user_can('manage_options')) return '';
     $atts = shortcode_atts(['month' => date('m'), 'year' => date('Y'), 'range' => 'month'], $atts);
 
     if ($atts['range'] === 'year') {
@@ -1327,6 +2032,7 @@ function studio_promo_shortcode() {
 add_shortcode('studio_promos', 'studio_promo_shortcode');
 
 function studio_equipment_value_shortcode() {
+    if (!current_user_can('manage_options')) return '';
     $equipment = get_posts(['post_type' => 'studio_equipment', 'post_status' => 'publish', 'numberposts' => -1]);
     $total_value = 0;
     $total_cost = 0;
@@ -1373,6 +2079,7 @@ function studio_health_shortcode() {
 add_shortcode('studio_health', 'studio_health_shortcode');
 
 function studio_booking_shortcode($atts) {
+    if (!current_user_can('manage_options')) return '';
     $atts = shortcode_atts(['status' => '', 'limit' => 10], $atts);
     $args = ['post_type' => 'studio_booking', 'post_status' => 'publish', 'posts_per_page' => intval($atts['limit']), 'orderby' => 'date', 'order' => 'DESC'];
     if (!empty($atts['status'])) {
@@ -1520,7 +2227,18 @@ function studio_render_invoice_manager() {
             ];
             foreach ($meta as $k => $v) update_post_meta($invoice_id, $k, $v);
             if ($booking_id) update_post_meta($booking_id, '_invoice_id', $invoice_id);
+
+            studio_generate_token($invoice_id);
             echo '<div class="notice notice-success"><p>Invoice #' . $invoice_id . ' created.</p></div>';
+
+            // Email admin notification
+            $admin = get_option('admin_email');
+            if ($admin) {
+                studio_send_email($admin, "New Invoice #{$invoice_id} Created — {$client_name}",
+                    '<p>A new invoice has been created for <strong>' . esc_html($client_name) . '</strong>.</p>' .
+                    studio_invoice_email_body($invoice_id) .
+                    '<p><a href="' . get_edit_post_link($invoice_id) . '">View invoice</a></p>');
+            }
         }
     }
 
@@ -1541,14 +2259,12 @@ function studio_render_invoice_manager() {
             studio_send_email($client_email, "Invoice #{$inv_id} - Roux's Audio Production",
                 '<p>Hi ' . esc_html($client_name) . ',</p>' .
                 '<p>Please find your invoice for <strong>' . esc_html($service) . '</strong>.</p>' .
-                '<div style="background:rgba(255,255,255,0.05);padding:20px;border-radius:8px;margin:20px 0;">' .
-                '<p><strong>Total:</strong> $' . number_format($total, 2) . '</p>' .
-                '<p><strong>Deposit Required:</strong> $' . number_format($deposit, 2) . '</p>' .
-                '<p><strong>Due Date:</strong> ' . esc_html($due) . '</p>' .
-                '</div>' .
+                studio_invoice_email_body($inv_id) .
                 '<p><a href="' . $pay_url . '" style="display:inline-block;padding:12px 32px;background:#d4a574;color:#0a0a0a;text-decoration:none;border-radius:8px;font-weight:bold;">Pay Deposit via PayPal</a></p>');
+            studio_send_email(get_option('admin_email'), "Invoice #{$inv_id} Sent to {$client_name}",
+                '<p>Invoice #' . $inv_id . ' for <strong>' . esc_html($client_name) . '</strong> has been emailed.</p>');
             update_post_meta($inv_id, '_status', 'Sent');
-            echo '<div class="notice notice-success"><p>Invoice #' . $inv_id . ' sent to ' . esc_html($client_email) . '.</p></div>';
+            echo '<div class="notice notice-success"><p>Invoice #' . $inv_id . ' sent to ' . esc_html($client_email) . '. Copy sent to you.</p></div>';
         }
     }
 
@@ -1557,7 +2273,27 @@ function studio_render_invoice_manager() {
         $inv_id = intval($_GET['mark_paid']);
         update_post_meta($inv_id, '_status', 'Paid');
         update_post_meta($inv_id, '_deposit_paid', 1);
-        echo '<div class="notice notice-success"><p>Invoice #' . $inv_id . ' marked as paid.</p></div>';
+        update_post_meta($inv_id, '_paid_date', current_time('mysql'));
+
+        $booking_id_m = intval(get_post_meta($inv_id, '_booking_id', true));
+        if ($booking_id_m) update_post_meta($booking_id_m, '_deposit_paid', '1');
+
+        $client_email_m = get_post_meta($inv_id, '_client_email', true);
+        $client_name_m = get_post_meta($inv_id, '_client_name', true);
+
+        if ($client_email_m) {
+            studio_send_email($client_email_m, "Payment Received — Invoice #{$inv_id}",
+                '<p>Hi ' . esc_html($client_name_m) . ',</p>' .
+                '<p>Your payment for <strong>Invoice #' . $inv_id . '</strong> has been received. Thank you!</p>');
+        }
+
+        $admin = get_option('admin_email');
+        if ($admin) {
+            studio_send_email($admin, "Payment Received — Invoice #{$inv_id}",
+                '<p>Invoice #' . $inv_id . ' for <strong>' . esc_html($client_name_m) . '</strong> has been marked as paid.</p>');
+        }
+
+        echo '<div class="notice notice-success"><p>Invoice #' . $inv_id . ' marked as paid. Confirmation sent.</p></div>';
     }
 
     $invoices = get_posts(['post_type' => 'studio_invoice', 'post_status' => 'publish', 'numberposts' => -1, 'orderby' => 'date', 'order' => 'DESC']);
@@ -1689,6 +2425,7 @@ add_action('rest_api_init', 'studio_register_rest_routes');
 function studio_booking_bulk_actions($actions) {
     $actions['studio_bulk_approve'] = 'Approve';
     $actions['studio_bulk_decline'] = 'Decline';
+    $actions['studio_bulk_reset'] = 'Reset to Pending';
     return $actions;
 }
 add_filter('bulk_actions-edit-studio_booking', 'studio_booking_bulk_actions');
@@ -1708,8 +2445,23 @@ function studio_booking_bulk_handler($redirect_to, $doaction, $post_ids) {
     if ($doaction === 'studio_bulk_decline') {
         foreach ($post_ids as $id) {
             update_post_meta($id, '_status', 'Declined');
+            $name = get_the_title($id);
+            $email = get_post_meta($id, '_client_email', true);
+            if ($email) {
+                studio_send_email($email, "Booking Request Declined",
+                    '<p>Hi ' . esc_html($name) . ',</p>' .
+                    '<p>We regret that we are unable to accommodate your booking request at this time.</p>');
+            }
         }
         return add_query_arg('bulk_declined', count($post_ids), $redirect_to);
+    }
+
+    if ($doaction === 'studio_bulk_reset') {
+        foreach ($post_ids as $id) {
+            update_post_meta($id, '_status', 'Pending');
+        }
+        studio_cache_flush('studio_dashboard_overview');
+        return add_query_arg('bulk_reset', count($post_ids), $redirect_to);
     }
 
     return $redirect_to;
@@ -1753,3 +2505,328 @@ function studio_admin_menu_order($menu) {
     return $reorder;
 }
 add_filter('global_menu_order', 'studio_admin_menu_order');
+
+/* ----------------------------------------------
+    DYNAMIC SVG CHART GENERATOR (for homepage financials, admin dashboards)
+    Renders an inline bar-chart SVG encoded as data-URI or raw markup.
+    Uses cached JSON so DB hit only happens once per TTL window.
+    ---------------------------------------------- */
+function studio_financial_svg_data() {
+	$cache = studio_cache_get('studio_home_financials', 600);
+	if ($cache) return $cache;
+
+	$month_start = date('Y-m-01');
+	$month_end   = date('Y-m-t');
+
+	// Approved bookings for month
+	$approved_q = new WP_Query(['post_type' => 'studio_booking', 'post_status' => 'publish', 'posts_per_page' => -1, 'fields' => 'ids', 'date_query' => [['after' => $month_start, 'before' => $month_end, 'inclusive' => true]]]);
+	$approved = $approved_q->found_posts;
+
+	// Monthly revenue (deposits confirmed paid or fully paid)
+	$revenue = 0;
+	$paid_invs = get_posts([
+		'post_type'   => 'studio_invoice',
+		'post_status' => 'publish',
+		'meta_query'  => ['relation' => 'OR',
+			['key' => '_deposit_paid', 'value' => 1],
+			['key' => '_status', 'value' => 'Paid'],
+		],
+		'date_query'  => [['after' => $month_start, 'before' => $month_end, 'inclusive' => true]],
+		'numberposts' => -1,
+		'fields'      => 'ids',
+	]);
+	foreach ($paid_invs as $id) {
+		$revenue += floatval(get_post_meta($id, '_total', true));
+	}
+
+	// Monthly expenses
+	$expenses = 0;
+	$exp_ids = get_posts([
+		'post_type'   => 'studio_expense',
+		'post_status' => 'publish',
+		'date_query'  => [['after' => $month_start, 'before' => $month_end, 'inclusive' => true]],
+		'numberposts' => -1,
+		'fields'      => 'ids',
+	]);
+	foreach ($exp_ids as $id) {
+		$expenses += floatval(get_post_meta($id, '_expense_amount', true));
+	}
+
+	$net = $revenue - $expenses;
+	$data = compact('approved', 'revenue', 'expenses', 'net');
+	studio_cache_set('studio_home_financials', $data, 600);
+	return $data;
+}
+
+function studio_render_finance_svg() {
+	$d = studio_financial_svg_data();
+	$max   = max($d['revenue'], $d['expenses'], 1);
+	$h_rev = round(($d['revenue'] / $max) * 120, 2);
+	$h_exp = round(($d['expenses'] / $max) * 120, 2);
+	$bar_w = 56;
+
+	return '<svg class="studio-finance-chart" viewBox="0 0 340 200" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Monthly financial overview">
+		<rect x="100" y="' . (180 - $h_rev) . '" width="' . $bar_w . '" height="' . $h_rev . '" rx="6" fill="#d4a574" opacity="0.85"/>
+		<rect x="220" y="' . (180 - $h_exp) . '" width="' . $bar_w . '" height="' . $h_exp . '" rx="6" fill="#dc3545" opacity="0.7"/>
+		<line x1="60" y1="180" x2="300" y2="180" stroke="rgba(255,255,255,0.12)" stroke-width="1"/>
+		<text x="128" y="196" text-anchor="middle" fill="#888" font-size="9" font-family="Inter,sans-serif">Revenue $' . number_format($d['revenue'], 0) . '</text>
+		<text x="248" y="196" text-anchor="middle" fill="#888" font-size="9" font-family="Inter,sans-serif">Exp. $' . number_format($d['expenses'], 0) . '</text>
+	</svg>';
+}
+
+/* ----------------------------------------------
+    DYNAMIC PLACEHOLDER COLORS (injected at admin load to keep brand palette in sync)
+    Returns a small JSON blob for frontend JS consumption via localized script.
+    ---------------------------------------------- */
+function studio_palette_json() {
+	return json_encode([
+		'gold'    => '#d4a574',
+		'bg'      => '#0a0a0a',
+		'surface' => 'rgba(255,255,255,0.04)',
+		'green'   => '#28a745',
+		'red'     => '#dc3545',
+		'blue'    => '#4a9eff',
+	]);
+}
+
+/* ----------------------------------------------
+    BACKUP REMINDER CRON (wildcard feature #1)
+    Emails site admin on first Sunday of every month to verify offsite backup exists.
+    ---------------------------------------------- */
+if (!wp_next_scheduled('studio_backup_reminder_event')) {
+	wp_schedule_event( strtotime('next sunday'), 'weekly', 'studio_backup_reminder_event' );
+}
+
+function studio_send_backup_reminder() {
+	$last_backup = get_option('studio_last_backup_confirmed');
+	if ($last_backup && intval($last_backup) > strtotime('-7 days')) return;
+
+	$admin = get_option('admin_email');
+	if (!$admin) return;
+
+	$body = '<p>Weekly systems reminder: Confirm a backup of <strong>' . get_bloginfo('name') . '</strong> has been copied to your offsite storage.</p>';
+	$body .= '<p>Last confirmed via dashboard reset: ' . ($last_backup ? date('M j, Y', intval($last_backup)) : 'Never') . '</p>';
+	$body .= '<p><a href="' . esc_url(admin_url()) . '" style="display:inline-block;padding:10px 24px;background:#d4a574;color:#0a0a0a;text-decoration:none;border-radius:8px;">Go to Dashboard</a></p>';
+
+	studio_send_email($admin, 'Backup Verification Reminder - Roux Studio', $body);
+}
+add_action('studio_backup_reminder_event', 'studio_send_backup_reminder');
+
+/* ----------------------------------------------
+    CLIENT SATISFACTION SURVEY POST-SESSION (wildcard feature #2)
+    Fires 48h after session slot, sends Net-Promoter-Style link to client.
+    ---------------------------------------------- */
+if (!wp_next_scheduled('studio_survey_event')) {
+	wp_schedule_event(time(), 'daily', 'studio_survey_event');
+}
+
+function studio_send_post_session_surveys() {
+	$bookings = get_posts([
+		'post_type'   => 'studio_booking',
+		'post_status' => 'publish',
+		'meta_key'    => '_status',
+		'meta_value'  => 'Approved',
+		'numberposts' => -1,
+	]);
+
+	foreach ($bookings as $bk) {
+		$slots = get_post_meta($bk->ID, '_booking_slots', true);
+		if (!is_array($slots)) continue;
+
+		foreach ($slots as $slot) {
+			if (empty($slot['date'])) continue;
+			$session_ts   = strtotime($slot['date']);
+			$send_at      = strtotime('+48 hours', $session_ts);
+			$sent_before  = get_post_meta($bk->ID, '_survey_sent_' . date('Ymd', $session_ts), true);
+
+			if (!$sent_before && time() >= $send_at) {
+				$client_email   = get_post_meta($bk->ID, '_client_email', true);
+				$token = get_post_meta($bk->ID, '_access_token', true);
+				if ($client_email && $token) {
+					$star_links = '';
+					for ($j = 1; $j <= 5; $j++) {
+						$fill = in_array($j, [4, 5]) ? '#28a745' : (in_array($j, [1, 2]) ? '#dc3545' : '#d4a574');
+						$url = add_query_arg(['_studio_survey' => 1, 'rating' => $j, 'booking_id' => $bk->ID, 'token' => $token], home_url('/'));
+						$star_links .= '<a href="' . esc_url($url) . '" style="display:inline-block;padding:6px 18px;background:' . esc_attr($fill) . ';color:#fff;text-decoration:none;border-radius:4px;margin:0 3px;">' . $j . '</a> ';
+					}
+
+					$email_body = '<p>Hi ' . esc_html(get_the_title($bk->ID)) . ',</p>' .
+						'<p>We hope you had a great session at Roux Studio. Could you spare 30 seconds to let us know how things went?</p>' .
+						'<p style="margin:24px 0;">' . $star_links . '</p>' .
+						'<p>Your feedback helps us keep improving our sound.</p>';
+
+					studio_send_email($client_email, 'How Was Your Session?', $email_body);
+				}
+				update_post_meta($bk->ID, '_survey_sent_' . date('Ymd', $session_ts), 1);
+			}
+			break;
+		}
+	}
+}
+add_action('studio_survey_event', 'studio_send_post_session_surveys');
+
+// Capture survey ratings hit
+function studio_survey_rating_capture() {
+	if (!isset($_GET['_studio_survey'])) return;
+	$booking_id = intval($_GET['booking_id'] ?? 0);
+	$rating     = intval($_GET['rating'] ?? 0);
+	$token      = sanitize_text_field($_GET['token'] ?? '');
+
+	if ($booking_id && in_array($rating, [1, 2, 3, 4, 5]) && studio_verify_token($booking_id, $token)) {
+		$existing = get_post_meta($booking_id, '_client_rating', true);
+		if (!$existing) {
+			update_post_meta($booking_id, '_client_rating', $rating);
+		}
+		header('Content-Type: image/gif');
+		echo base64_decode('R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==');
+		exit;
+	}
+}
+add_action('init', 'studio_survey_rating_capture');
+
+/* ----------------------------------------------
+    STANDALONE INVOICE & TAX DASHBOARD TEMPLATE (Phase 2)
+    Registers template so user can assign "Invoice Dashboard" page.
+    Returns raw HTML injected via shortcode or direct template render.
+    ---------------------------------------------- */
+function studio_invoice_dashboard_html() {
+	if (!current_user_can('manage_options')) return '<p style="color:var(--text-muted);">Access restricted.</p>';
+
+	$year   = intval($_GET['year'] ?? date('Y'));
+	$start  = "$year-01-01";
+	$end    = "$year-12-31";
+
+	$invoices = get_posts([
+		'post_type'   => 'studio_invoice',
+		'post_status' => 'publish',
+		'date_query'  => [['after' => $start, 'before' => $end, 'inclusive' => true]],
+		'numberposts' => -1,
+	]);
+
+	$revenue = 0; $tax_collected = 0; $paid_count = 0; $pending_total = 0;
+	$status_counts = ['Draft' => 0, 'Sent' => 0, 'Paid' => 0];
+
+	foreach ($invoices as $inv) {
+		$total    = floatval(get_post_meta($inv->ID, '_total', true));
+		$tax      = floatval(get_post_meta($inv->ID, '_tax_collected', true));
+		$status   = get_post_meta($inv->ID, '_status', true) ?: 'Draft';
+		$paid     = get_post_meta($inv->ID, '_deposit_paid', true);
+
+		$tax_collected += $tax;
+		if (isset($status_counts[$status])) $status_counts[$status]++;
+		else $status_counts['Other'] = ($status_counts['Other'] ?? 0) + 1;
+
+		if ($paid || $status === 'Paid') {
+			$revenue += $total;
+			$paid_count++;
+		} else {
+			$pending_total += $total;
+		}
+	}
+
+	$expenses = get_posts([
+		'post_type'   => 'studio_expense',
+		'post_status' => 'publish',
+		'date_query'  => [['after' => $start, 'before' => $end, 'inclusive' => true]],
+		'numberposts' => -1,
+	]);
+
+	$expense_total = 0;
+	$exp_by_cat    = [];
+	foreach ($expenses as $ex) {
+		$amt = floatval(get_post_meta($ex->ID, '_expense_amount', true));
+		$cat = get_post_meta($ex->ID, '_expense_category', true) ?: 'Other';
+		$expense_total += $amt;
+		$exp_by_cat[$cat] = ($exp_by_cat[$cat] ?? 0) + $amt;
+	}
+
+	$net     = $revenue - $expense_total;
+	$margin  = $revenue > 0 ? round($net / $revenue * 100, 1) : 0;
+
+	$ob = '<div class="glass">';
+	$ob .= '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;">';
+	$ob .= '<h3 style="margin:0;">Invoice & Tax Dashboard <span style="color:var(--text-muted);font-weight:400;font-size:1rem;">' . $year . '</span></h3>';
+	$ob .= '<form method="get" style="display:flex;gap:8px;"><input type="number" name="year" value="' . esc_attr($year) . '" style="padding:6px 10px;background:rgba(255,255,255,0.05);border:1px solid var(--surface-border);border-radius:4px;color:#e0e0e0;width:80px;"><button type="submit" class="btn btn-sm">Filter</button></form>';
+	$ob .= '</div>';
+
+	// KPI row
+	$ob .= '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:16px;margin-bottom:24px;">';
+	$kpi_data = [
+		['label' => 'Gross Revenue',       'val' => '$' . number_format($revenue, 2),           'color' => 'var(--green)'],
+		['label' => 'Total Expenses',      'val' => '$' . number_format($expense_total, 2),     'color' => 'var(--red)'],
+		['label' => 'Net Profit',          'val' => '$' . number_format($net, 2),              'color' => $net >= 0 ? 'var(--green)' : 'var(--red)'],
+		['label' => 'Profit Margin',       'val' => $margin . '%',                              'color' => $net >= 0 ? 'var(--green)' : 'var(--red)'],
+		['label' => 'Sales Tax Collected', 'val' => '$' . number_format($tax_collected, 2),     'color' => 'var(--blue)'],
+		['label' => 'Pending Revenue',     'val' => '$' . number_format($pending_total, 2),     'color' => 'var(--gold)'],
+	];
+	foreach ($kpi_data as $kpi) {
+		$ob .= '<div style="background:rgba(255,255,255,0.03);padding:16px;border-radius:8px;">';
+		$ob .= '<p style="color:var(--text-muted);font-size:0.75rem;text-transform:uppercase;letter-spacing:1px;margin:0 0 8px;">' . $kpi['label'] . '</p>';
+		$ob .= '<p style="margin:0;font-size:1.4rem;font-weight:600;color:' . $kpi['color'] . ';">' . $kpi['val'] . '</p>';
+		$ob .= '</div>';
+	}
+	$ob .= '</div>';
+
+	// Status breakdown
+	$ob .= '<h4 style="margin-bottom:12px;">Invoice Status Breakdown</h4>';
+	foreach ($status_counts as $status => $count) {
+		$pct = count($invoices) > 0 ? round($count / count($invoices) * 100) : 0;
+		$clr = 'var(--gold)';
+		if ($status === 'Paid') $clr = 'var(--green)';
+		elseif ($status === 'Sent') $clr = 'var(--red)';
+
+		$ob .= '<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--surface-border);">';
+		$ob .= '<span style="color:var(--text-muted);">' . esc_html($status) . '</span>';
+		$ob .= '<div style="display:flex;align-items:center;gap:12px;">';
+		$ob .= '<div style="flex:1;height:6px;background:rgba(255,255,255,0.06);border-radius:3px;"><div style="height:100%;width:' . $pct . '%;background:' . $clr . ';border-radius:3px;"></div></div>';
+		$ob .= '<span style="min-width:36px;text-align:right;">' . $count . '</span>';
+		$ob .= '</div></div>';
+	}
+
+	if (!empty($exp_by_cat)) {
+		arsort($exp_by_cat);
+		$ob .= '<h4 style="margin-top:24px;margin-bottom:12px;">Expense Breakdown</h4>';
+		foreach ($exp_by_cat as $cat => $amt) {
+			$pct = $expense_total > 0 ? round($amt / $expense_total * 100) : 0;
+			$ob .= '<div style="display:flex;justify-content:space-between;padding:6px 0;font-size:0.9rem;">';
+			$ob .= '<span style="color:var(--text-muted);">' . esc_html($cat) . ' (' . $pct . '%)</span>';
+			$ob .= '<span>$' . number_format($amt, 2) . '</span>';
+			$ob .= '</div>';
+		}
+	}
+
+	// Inline SVG mini-chart
+	$max_b = max($revenue, $expense_total, 1);
+	$h_r = round(($revenue / $max_b) * 80, 2);
+	$h_e = round(($expense_total / $max_b) * 80, 2);
+	$ob .= '<svg style="display:block;margin:24px auto 0;" viewBox="0 0 200 130" xmlns="http://www.w3.org/2000/svg">';
+	$ob .= '<rect x="50" y="' . (110 - $h_r) . '" width="40" height="' . $h_r . '" rx="4" fill="#d4a574" opacity="0.85"/>';
+	$ob .= '<rect x="120" y="' . (110 - $h_e) . '" width="40" height="' . $h_e . '" rx="4" fill="#dc3545" opacity="0.7"/>';
+	$ob .= '<line x1="30" y1="110" x2="180" y2="110" stroke="rgba(255,255,255,0.1)" stroke-width="1"/>';
+	$ob .= '</svg>';
+
+	$ob .= '<p style="font-size:0.7rem;color:var(--text-dim);margin-top:16px;">For informational purposes. Consult a tax professional for filing.</p>';
+	$ob .= '</div>';
+
+	return $ob;
+}
+add_shortcode('studio_invoice_dashboard', 'studio_invoice_dashboard_html');
+
+/* ----------------------------------------------
+    AJAX HANDLERS (Backup confirmation, Survey capture)
+    ---------------------------------------------- */
+function studio_ajax_confirm_backup() {
+	check_ajax_referer('studio_confirm_backup_ajax', 'nonce');
+	if (!current_user_can('manage_options')) wp_send_json_error();
+	update_option('studio_last_backup_confirmed', time());
+	wp_send_json_success();
+}
+add_action('wp_ajax_studio_confirm_backup', 'studio_ajax_confirm_backup');
+
+/* Enqueue jQuery + localize ajaxurl on front-end pages that need it */
+function studio_enqueue_dashboard_deps() {
+	if (get_page_template_slug() !== 'page-invoice-dashboard.php') return;
+	wp_enqueue_script('jquery');
+	wp_localize_script('jquery', 'studioAjax', ['ajaxUrl' => admin_url('admin-ajax.php')]);
+}
+add_action('wp_enqueue_scripts', 'studio_enqueue_dashboard_deps');
