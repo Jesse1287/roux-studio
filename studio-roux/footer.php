@@ -3,7 +3,6 @@
     <p>&copy; <?php echo date('Y'); ?> Roux's Audio Production. All rights reserved.</p>
     <ul class="footer-links">
       <li><a href="<?php echo home_url('/booking/'); ?>">Book</a></li>
-      <li><a href="<?php echo home_url('/gigs/'); ?>">Gigs</a></li>
       <li><a href="<?php echo home_url('/equipment/'); ?>">Gear</a></li>
       <li><a href="<?php echo home_url('/blog/'); ?>">Blog</a></li>
       <?php if (is_user_logged_in()) : ?>
