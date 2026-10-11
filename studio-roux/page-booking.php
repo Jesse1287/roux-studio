@@ -4,6 +4,14 @@
  */
 get_header();
 
+$studio_rates = studio_service_rates();
+$studio_js_rates = [];
+foreach ($studio_rates as $key => $info) {
+    $pos = strpos($info['label'], ' - ');
+    $js_key = ($pos !== false) ? substr($info['label'], 0, $pos) : $info['label'];
+    $studio_js_rates[$js_key] = ['rate' => $info['rate'], 'hourly' => $info['hourly']];
+}
+
 if (isset($_GET['booking']) && $_GET['booking'] === 'sent') : ?>
 <main class="page-content">
   <div class="container container-narrow" style="padding:120px 24px;text-align:center;">
@@ -50,12 +58,11 @@ if (isset($_GET['booking']) && $_GET['booking'] === 'sent') : ?>
           <label for="service">Service *</label>
           <select id="service" name="service" required>
             <option value="">Select a service...</option>
-            <option value="Tier 1 - Recording ($75/hr)" data-hourly="true">Tier 1 - Recording ($75/hr)</option>
-            <option value="Tier 2 - Mixing ($150)">Tier 2 - Mixing ($150)</option>
-            <option value="Tier 3 - Mixing + Mastering ($200)">Tier 3 - Mixing + Mastering ($200)</option>
-            <option value="Tier 4 - Full Production ($250)">Tier 4 - Full Production ($250)</option>
-            <option value="FOH Engineer ($50/hr)" data-hourly="true">FOH Engineer - Live Sound ($50/hr)</option>
-            <option value="Consultation (Free)">Consultation (Free)</option>
+            <?php foreach ($studio_rates as $key => $info):
+                $suffix = $info['rate'] <= 0 ? 'Free' : ($info['hourly'] ? '$' . $info['rate'] . '/hr' : '$' . $info['rate']);
+                $opt_label = $info['label'] . ' (' . $suffix . ')'; ?>
+            <option value="<?php echo esc_attr($opt_label); ?>"<?php echo $info['hourly'] ? ' data-hourly="true"' : ''; ?>><?php echo esc_html($opt_label); ?></option>
+            <?php endforeach; ?>
           </select>
         </div>
 
@@ -107,18 +114,11 @@ if (isset($_GET['booking']) && $_GET['booking'] === 'sent') : ?>
 </main>
 <script>
 (function(){
-  var rates = {
-    "Tier 1": {rate:75,hourly:true},
-    "Tier 2": {rate:150,hourly:false},
-    "Tier 3": {rate:200,hourly:false},
-    "Tier 4": {rate:250,hourly:false},
-    "FOH Engineer": {rate:50,hourly:true},
-    "Consultation": {rate:0,hourly:false}
-  };
+  var rates = <?php echo wp_json_encode($studio_js_rates); ?>;
   function getRate(svc){
     if(!svc) return null;
     for(var k in rates){ if(svc.indexOf(k)!==-1) return rates[k]; }
-    return {rate:75,hourly:true};
+    return <?php echo wp_json_encode($studio_js_rates['Tier 1'] ?? ['rate'=>75,'hourly'=>true]); ?>;
   }
   function calcHours(s,e){
     if(!s||!e) return 0;

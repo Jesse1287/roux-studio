@@ -1,0 +1,22 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*~
+.vscode/
+.idea/
+
+# Logs / temp
+debug.log
+*.log
+*.bak
+*.tmp
+
+# Builds / vendor
+node_modules/
+package-lock.json
+
+# Zip archives of the theme
+*.zip

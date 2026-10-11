@@ -28,7 +28,6 @@
       <ul>
         <li><a href="<?php echo home_url('/'); ?>" <?php echo is_front_page() ? 'class="active"' : ''; ?>>Home</a></li>
         <li><a href="<?php echo home_url('/booking/'); ?>" <?php echo is_page('booking') ? 'class="active"' : ''; ?>>Book</a></li>
-        <li><a href="<?php echo home_url('/gigs/'); ?>" <?php echo is_page('gigs') ? 'class="active"' : ''; ?>>Gigs</a></li>
         <li><a href="<?php echo get_permalink(10); ?>" <?php echo is_page('equipment') ? 'class="active"' : ''; ?>>Equipment</a></li>
         <li><a href="<?php echo home_url('/blog/'); ?>" <?php echo is_page('blog') || is_singular('post') ? 'class="active"' : ''; ?>>Blog</a></li>
         <?php if ($logged_in) : ?>

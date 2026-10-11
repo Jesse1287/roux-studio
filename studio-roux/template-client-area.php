@@ -8,6 +8,7 @@ get_header();
 
 $booking = null;
 $booking_id = 0;
+$email = '';
 
 // Rate-limit lookups to prevent enumeration brute-force (15 per hour per IP)
 $ip = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
@@ -76,6 +77,10 @@ if (!$booking && isset($_GET['ref']) && isset($_GET['email'])) {
 
     <?php if ($booking) :
         $status = get_post_meta($booking->ID, '_status', true) ?: 'Pending';
+      $job_status = get_post_meta($booking->ID, '_job_status', true);
+      if (!$job_status && $status === 'Approved') $job_status = 'Scheduled';
+      $job_history = get_post_meta($booking->ID, '_job_status_history', true);
+      if (!is_array($job_history)) $job_history = [];
         $service = get_post_meta($booking->ID, '_service', true);
         $notes = get_post_meta($booking->ID, '_notes', true);
         $slots = get_post_meta($booking->ID, '_booking_slots', true);
@@ -101,6 +106,19 @@ if (!$booking && isset($_GET['ref']) && isset($_GET['email'])) {
             <p style="color:var(--gold);letter-spacing:2px;text-transform:uppercase;font-size:0.85rem;margin:0;">Booking #<?php echo $booking->ID; ?></p>
             <span class="badge badge-<?php echo esc_attr($cls); ?>"><?php echo esc_html($status); ?></span>
           </div>
+
+          <?php if ($job_status) : ?>
+          <div style="margin-bottom:20px;padding:14px 16px;border-left:3px solid var(--gold);background:rgba(255,255,255,0.03);">
+            <strong>Session progress: <?php echo esc_html($job_status); ?></strong>
+            <?php if (!empty($job_history)) : ?>
+            <ol style="margin:10px 0 0;padding-left:20px;color:var(--text-muted);font-size:0.85rem;">
+              <?php foreach ($job_history as $entry) : ?>
+              <li><?php echo esc_html($entry['status'] ?? ''); ?><?php if (!empty($entry['at'])) : ?> — <?php echo esc_html(date('M j, Y g:i A', strtotime($entry['at']))); ?><?php endif; ?></li>
+              <?php endforeach; ?>
+            </ol>
+            <?php endif; ?>
+          </div>
+          <?php endif; ?>
 
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:20px;">
             <div>
@@ -191,13 +209,19 @@ if (!$booking && isset($_GET['ref']) && isset($_GET['email'])) {
             $inv_deposit = floatval(get_post_meta($invoice->ID, '_deposit', true));
             $inv_deposit_paid = get_post_meta($invoice->ID, '_deposit_paid', true);
             $inv_status = get_post_meta($invoice->ID, '_status', true) ?: 'Draft';
+            $inv_display_status = $inv_status === 'Draft' && $status === 'Approved' ? 'Deposit Due' : $inv_status;
+            $inv_badge_class = $inv_display_status === 'Deposit Due' ? 'sent' : strtolower($inv_display_status);
+            $inv_paid_amount = floatval(get_post_meta($invoice->ID, '_paid_amount', true));
+            if ($inv_status === 'Paid' && $inv_paid_amount <= 0) $inv_paid_amount = $inv_total;
+            $inv_balance_due = max(0, $inv_total - $inv_paid_amount);
             $inv_due = get_post_meta($invoice->ID, '_due_date', true);
             $pay_url = add_query_arg(['action' => 'pay_deposit', 'invoice_id' => $invoice->ID, 'token' => $token_val], home_url('/'));
+            $pdf_url = add_query_arg(['action' => 'download_invoice_pdf', 'invoice_id' => $invoice->ID, 'token' => $token_val], home_url('/'));
         ?>
         <div class="glass" style="margin-top:24px;">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
             <h3 style="margin:0;font-size:1rem;letter-spacing:1px;text-transform:uppercase;color:var(--gold);">Invoice</h3>
-            <span class="badge badge-<?php echo esc_attr(strtolower($inv_status)); ?>"><?php echo esc_html($inv_status); ?></span>
+            <span class="badge badge-<?php echo esc_attr($inv_badge_class); ?>"><?php echo esc_html($inv_display_status); ?></span>
           </div>
 
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;">
@@ -209,17 +233,27 @@ if (!$booking && isset($_GET['ref']) && isset($_GET['email'])) {
               <p style="color:var(--text-muted);font-size:0.75rem;margin:0 0 4px;text-transform:uppercase;">Deposit</p>
               <p style="margin:0;font-weight:600;font-size:1.2rem;">$<?php echo number_format($inv_deposit, 2); ?></p>
             </div>
+            <div style="padding:12px 16px;background:rgba(255,255,255,0.03);border-radius:var(--radius-sm);">
+              <p style="color:var(--text-muted);font-size:0.75rem;margin:0 0 4px;text-transform:uppercase;">Paid to Date</p>
+              <p style="margin:0;font-weight:600;font-size:1.2rem;">$<?php echo number_format($inv_paid_amount, 2); ?></p>
+            </div>
+            <div style="padding:12px 16px;background:rgba(255,255,255,0.03);border-radius:var(--radius-sm);">
+              <p style="color:var(--text-muted);font-size:0.75rem;margin:0 0 4px;text-transform:uppercase;">Balance Due</p>
+              <p style="margin:0;font-weight:600;font-size:1.2rem;">$<?php echo number_format($inv_balance_due, 2); ?></p>
+            </div>
           </div>
 
           <?php if ($inv_due) : ?>
             <p style="color:var(--text-muted);font-size:0.85rem;margin-bottom:16px;">Due by <?php echo esc_html(date('M j, Y', strtotime($inv_due))); ?></p>
           <?php endif; ?>
+          <p><a href="<?php echo esc_url($pdf_url); ?>">Download invoice PDF</a></p>
 
-          <?php if (!$inv_deposit_paid && $inv_status !== 'Paid') : ?>
-            <a href="<?php echo esc_url($pay_url); ?>" class="btn btn-primary btn-block" style="padding:16px;">Pay Deposit via PayPal</a>
+          <?php if ($inv_balance_due > 0 && $inv_status !== 'Paid') : ?>
+            <?php $payment_label = $inv_deposit_paid ? 'Pay Remaining Balance' : ($inv_paid_amount > 0 ? 'Complete Deposit' : 'Pay Deposit'); ?>
+            <a href="<?php echo esc_url($pay_url); ?>" class="btn btn-primary btn-block" style="padding:16px;"><?php echo esc_html($payment_label); ?> via PayPal</a>
           <?php else : ?>
             <div style="text-align:center;padding:12px;background:rgba(40,167,69,0.1);border-radius:var(--radius-sm);border:1px solid rgba(40,167,69,0.3);">
-              <span style="color:var(--green);font-weight:600;">Deposit Paid</span>
+              <span style="color:var(--green);font-weight:600;">Paid in Full</span>
             </div>
           <?php endif; ?>
         </div>
