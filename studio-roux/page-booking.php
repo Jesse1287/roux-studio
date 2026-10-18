@@ -96,6 +96,11 @@ if (isset($_GET['booking']) && $_GET['booking'] === 'sent') : ?>
         </div>
 
         <div class="form-group">
+          <label for="promo_code">Promo Code</label>
+          <input type="text" id="promo_code" name="promo_code" placeholder="Enter your promo code, if any">
+        </div>
+
+        <div class="form-group">
           <label for="location">Location</label>
           <input type="text" id="location" name="location" placeholder="Studio or venue address">
         </div>

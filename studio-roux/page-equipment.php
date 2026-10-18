@@ -42,10 +42,12 @@ get_header(); ?>
         <div class="stat-number"><?php echo $total_items; ?></div>
         <div class="stat-label">Total Items</div>
       </div>
+      <?php if (current_user_can('manage_options')) : ?>
       <div class="glass glass-compact stat-card">
         <div class="stat-number">$<?php echo number_format($total_value, 0); ?></div>
         <div class="stat-label">Total Value</div>
       </div>
+      <?php endif; ?>
       <?php
       $shown = 0;
       foreach (['Excellent', 'Good', 'Fair', 'Poor', 'Needs Repair'] as $c) {
@@ -102,7 +104,7 @@ get_header(); ?>
                 <?php if ($condition) : ?>
                   <span class="badge badge-<?php echo $cond_cls === 'excellent' ? 'approved' : ($cond_cls === 'good' ? 'sent' : ($cond_cls === 'fair' ? 'new' : 'declined')); ?>"><?php echo esc_html($condition); ?></span>
                 <?php endif; ?>
-                <?php if ($value) : ?><span>$<?php echo number_format(floatval($value), 2); ?></span><?php endif; ?>
+                <?php if ($value && current_user_can('manage_options')) : ?><span>$<?php echo number_format(floatval($value), 2); ?></span><?php endif; ?>
                 <?php if ($maint_overdue) : ?>
                   <span style="color:var(--red);font-weight:600;">&#9888; Maintenance overdue</span>
                 <?php elseif ($maint_soon) : ?>

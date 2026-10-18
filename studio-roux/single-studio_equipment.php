@@ -59,19 +59,19 @@
                 <p style="margin:0;font-weight:600;"><?php echo date('M j, Y', strtotime($purchase_date)); ?></p>
               </div>
             <?php endif; ?>
-            <?php if ($purchase_price) : ?>
+            <?php if ($purchase_price && current_user_can('manage_options')) : ?>
               <div style="padding:12px 16px;background:rgba(255,255,255,0.03);border-radius:var(--radius-sm);">
                 <p style="color:var(--text-muted);font-size:0.7rem;text-transform:uppercase;letter-spacing:1px;margin:0 0 4px;">Purchase Price</p>
                 <p style="margin:0;font-weight:600;">$<?php echo number_format(floatval($purchase_price), 2); ?></p>
               </div>
             <?php endif; ?>
-            <?php if ($current_value) : ?>
+            <?php if ($current_value && current_user_can('manage_options')) : ?>
               <div style="padding:12px 16px;background:rgba(255,255,255,0.03);border-radius:var(--radius-sm);">
                 <p style="color:var(--text-muted);font-size:0.7rem;text-transform:uppercase;letter-spacing:1px;margin:0 0 4px;">Current Value</p>
                 <p style="margin:0;font-weight:600;">$<?php echo number_format(floatval($current_value), 2); ?></p>
               </div>
             <?php endif; ?>
-            <?php if ($purchase_price && $current_value) :
+            <?php if ($purchase_price && $current_value && current_user_can('manage_options')) :
               $depr = floatval($purchase_price) - floatval($current_value);
               $pct = floatval($purchase_price) > 0 ? round($depr / floatval($purchase_price) * 100) : 0;
             ?>

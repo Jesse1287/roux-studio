@@ -1,6 +1,6 @@
 <?php get_header(); ?>
 <main class="page-content">
-  <div class="container container-narrow">
+  <div class="container container-wide">
     <?php if (have_posts()) : while (have_posts()) : the_post();
       $cats = get_the_category();
       $cat_name = !empty($cats) ? $cats[0]->name : '';
@@ -21,8 +21,8 @@
       </p>
 
       <?php if (has_post_thumbnail()) : ?>
-        <div style="margin-bottom:32px;border-radius:var(--radius);overflow:hidden;">
-          <?php the_post_thumbnail('large', ['style' => 'width:100%;height:auto;display:block;', 'loading' => 'lazy']); ?>
+        <div style="margin:0 auto 32px;border-radius:var(--radius);overflow:hidden;max-width:540px;">
+          <?php the_post_thumbnail('medium', ['style' => 'width:100%;height:auto;display:block;', 'loading' => 'lazy']); ?>
         </div>
       <?php endif; ?>
 
@@ -68,4 +68,35 @@
     <?php endwhile; endif; ?>
   </div>
 </main>
+
+<?php if (is_singular('post')) : ?>
+<section class="container" style="max-width:860px;margin:0 auto;padding:0 24px 64px;">
+  <?php if (get_comments_number()) : ?>
+    <div class="glass" style="padding:32px 28px;border-radius:16px;margin-top:48px;">
+      <h3 style="color:var(--gold);font-size:1.1rem;margin-bottom:20px;"><?php comments_number('No Comments Yet', '1 Comment', '% Comments'); ?></h3>
+      <ol class="comment-list" style="list-style:none;padding:0;margin:0;">
+        <?php wp_list_comments(['style' => 'ol', 'short_ping' => true, 'avatar_size' => 36]); ?>
+      </ol>
+      <?php the_comments_navigation(); ?>
+    </div>
+  <?php endif; ?>
+
+  <?php if (!comments_open()) : ?>
+    <div class="glass" style="padding:28px;text-align:center;border-radius:16px;margin-top:48px;">
+      <p style="color:var(--text-muted);margin:0;">Comments are not enabled for this post yet.</p>
+      <p style="color:var(--text-muted);font-size:0.8rem;margin-top:12px;">Tip: open the post in the editor and enable &ldquo;Allow comments&rdquo; in the Discussion panel.</p>
+    </div>
+  <?php elseif (is_user_logged_in()) : ?>
+    <div class="glass" style="padding:28px;border-radius:16px;margin-top:48px;">
+      <?php comment_form(['title_reply' => '<h3 style="color:var(--gold);font-size:1.1rem;margin-bottom:16px;">Join the Discussion</h3>']); ?>
+    </div>
+  <?php else : ?>
+    <div class="glass" style="padding:28px;text-align:center;border-radius:16px;margin-top:48px;">
+      <p style="color:var(--text-muted);margin-bottom:16px;">Comments are open to studio members only.</p>
+      <a href="<?php echo esc_url(wp_login_url(get_permalink())); ?>" class="btn btn-primary">Log In to Comment</a>
+    </div>
+  <?php endif; ?>
+</section>
+<?php endif; ?>
+
 <?php get_footer(); ?>

@@ -15,9 +15,9 @@ $args = [
 ];
 
 if ($current_cat && $current_cat !== 'all') {
-    $cat_id = get_cat_ID($current_cat);
-    if ($cat_id) {
-        $args['cat__in'] = [$cat_id];
+    $cat = get_term_by('slug', $current_cat, 'category');
+    if ($cat) {
+        $args['category__in'] = [$cat->term_id];
     }
 }
 
@@ -25,7 +25,7 @@ $blog = new WP_Query($args);
 $categories = get_categories(['hide_empty' => true, 'orderby' => 'name', 'order' => 'ASC']);
 ?>
 <main class="page-content">
-  <div class="container">
+  <div class="container container-wide">
     <div class="section-title">
       <h2>Blog</h2>
       <p>Thoughts on music, faith, and the craft of audio production.</p>

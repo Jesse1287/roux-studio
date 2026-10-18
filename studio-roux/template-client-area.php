@@ -89,7 +89,6 @@ if (!$booking && isset($_GET['ref']) && isset($_GET['email'])) {
         $location = get_post_meta($booking->ID, '_location', true);
         $submitted = get_post_meta($booking->ID, '_submitted_at', true);
         $counter_rate = get_post_meta($booking->ID, '_counter_rate', true);
-        $counter_hours = get_post_meta($booking->ID, '_counter_hours', true);
         $counter_message = get_post_meta($booking->ID, '_counter_message', true);
         $token_val = get_post_meta($booking->ID, '_access_token', true);
         $cls = strtolower(str_replace('-', '', $status));
@@ -126,9 +125,10 @@ if (!$booking && isset($_GET['ref']) && isset($_GET['email'])) {
               <p style="margin:0;font-weight:600;"><?php echo esc_html($service); ?></p>
             </div>
             <?php if ($rate) : ?>
+            <?php $rate_hourly_c = studio_rate_for_service($service)['hourly']; ?>
             <div>
               <p style="color:var(--text-muted);font-size:0.75rem;text-transform:uppercase;letter-spacing:1px;margin:0 0 4px;">Rate</p>
-              <p style="margin:0;font-weight:600;">$<?php echo esc_html($rate); ?>/hr</p>
+              <p style="margin:0;font-weight:600;">$<?php echo esc_html(number_format((float) $rate, 2)); ?><?php echo $rate_hourly_c ? '/hr' : ' flat'; ?></p>
             </div>
             <?php endif; ?>
             <?php if ($total) : ?>
@@ -168,6 +168,9 @@ if (!$booking && isset($_GET['ref']) && isset($_GET['email'])) {
         </div>
 
         <?php if ($status === 'Counter-Offer' && $counter_rate) :
+            $counter_basis = get_post_meta($booking->ID, '_counter_basis', true);
+            if (!in_array($counter_basis, ['hr', 'flat'], true)) $counter_basis = studio_rate_for_service($service)['hourly'] ? 'hr' : 'flat';
+            $counter_total = $counter_basis === 'hr' ? (float) $counter_rate * max(1, (float) $total) : (float) $counter_rate;
             $accept_url = wp_nonce_url(
                 add_query_arg(['action' => 'accept_counter', 'booking_id' => $booking->ID, 'token' => $token_val], home_url('/')),
                 'studio_booking_action_' . $booking->ID
@@ -187,15 +190,9 @@ if (!$booking && isset($_GET['ref']) && isset($_GET['email'])) {
           <?php endif; ?>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px;">
             <div style="padding:12px 16px;background:rgba(255,255,255,0.03);border-radius:var(--radius-sm);">
-              <p style="color:var(--text-muted);font-size:0.75rem;margin:0 0 4px;text-transform:uppercase;">New Rate</p>
-              <p style="margin:0;font-weight:600;color:var(--gold);">$<?php echo esc_html($counter_rate); ?>/hr</p>
+              <p style="color:var(--text-muted);font-size:0.75rem;margin:0 0 4px;text-transform:uppercase;">New Total</p>
+              <p style="margin:0;font-weight:600;color:var(--gold);">$<?php echo esc_html(number_format($counter_total, 2)); ?></p>
             </div>
-            <?php if ($counter_hours) : ?>
-            <div style="padding:12px 16px;background:rgba(255,255,255,0.03);border-radius:var(--radius-sm);">
-              <p style="color:var(--text-muted);font-size:0.75rem;margin:0 0 4px;text-transform:uppercase;">Estimated Hours</p>
-              <p style="margin:0;font-weight:600;"><?php echo esc_html($counter_hours); ?></p>
-            </div>
-            <?php endif; ?>
           </div>
           <div style="display:flex;gap:12px;">
             <a href="<?php echo esc_url($accept_url); ?>" class="btn btn-success btn-block">Accept Offer</a>

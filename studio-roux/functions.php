@@ -52,12 +52,25 @@ function studio_service_rates() {
 
 function studio_rate_for_service($service) {
     $rates = studio_service_rates();
-    foreach ($rates as $key => $info) {
-        if (strpos($service, $info['label']) !== false || strpos($service, $key) !== false) {
+    $service = trim((string) $service);
+    if ($service === '') {
+        return ['rate' => 0, 'hourly' => true, 'label' => $service, 'desc' => 'No service selected'];
+    }
+    // Full labels first (case-insensitive) so e.g. "Mixing + Mastering" is not mistaken for "Mixing".
+    foreach ($rates as $info) {
+        if (stripos($service, $info['label']) !== false) {
             return $info;
         }
     }
-    return ['rate' => 75, 'hourly' => true, 'label' => $service, 'desc' => '$75/hr'];
+    // Then short keys, also case-insensitive (stored values like "FOH" previously fell through
+    // the case-sensitive strpos and hit the $75/hr fallback).
+    foreach ($rates as $key => $info) {
+        if (stripos($service, $key) !== false) {
+            return $info;
+        }
+    }
+    studio_log_error('studio_rate_for_service: no rate matched for service string', ['service' => $service]);
+    return ['rate' => 0, 'hourly' => true, 'label' => $service, 'desc' => 'No matching rate'];
 }
 
 /* ----------------------------------------------
@@ -566,6 +579,23 @@ function studio_send_invoice_email($invoice_id, $to, $subject, $intro_html = '',
 /* ----------------------------------------------
     BOOKING FORM HANDLER
     ---------------------------------------------- */
+/* Look up a published promotion by code (case-insensitive).
+   Returns ['value' => float, 'type' => 'percent'|'flat'] or null when not found. */
+function studio_find_promo($code) {
+    $code = trim((string) $code);
+    if ($code === '') return null;
+    $promos = get_posts(['post_type' => 'studio_promo', 'post_status' => 'publish', 'numberposts' => 100]);
+    foreach ($promos as $p) {
+        $pc = trim((string) get_post_meta($p->ID, '_promo_code', true));
+        if ($pc === '' || strcasecmp($pc, $code) !== 0) continue;
+        $raw = trim((string) get_post_meta($p->ID, '_promo_discount', true));
+        if ($raw === '') return null;
+        if (stripos($raw, '%') !== false) return ['value' => (float) rtrim($raw, '% '), 'type' => 'percent'];
+        return ['value' => (float) $raw, 'type' => 'flat'];
+    }
+    return null;
+}
+
 function studio_booking_handler() {
     if (!isset($_SERVER['REQUEST_METHOD']) || $_SERVER['REQUEST_METHOD'] !== 'POST' || !isset($_POST['studio_booking'])) return;
 
@@ -620,7 +650,12 @@ function studio_booking_handler() {
     $service  = sanitize_text_field($_POST['service'] ?? '');
     $notes    = sanitize_textarea_field($_POST['notes'] ?? '');
     $location = sanitize_text_field($_POST['location'] ?? '');
+    $promo_code = sanitize_text_field($_POST['promo_code'] ?? '');
+    $promo = studio_find_promo($promo_code);
 
+    // The public select posts "Label ($50/hr)" — resolve to the canonical rate-table label
+    // so stored _service always matches exactly (prevents duplicate options in the admin dropdown).
+    $service = studio_rate_for_service($service)['label'];
     $rate_info = studio_rate_for_service($service);
     $is_hourly = $rate_info['hourly'];
 
@@ -663,6 +698,11 @@ function studio_booking_handler() {
         update_post_meta($post_id, '_total_hours', $total_hours);
         update_post_meta($post_id, '_booking_slots', $slots);
         update_post_meta($post_id, '_submitted_at', current_time('mysql'));
+        if ($promo) {
+            update_post_meta($post_id, '_promo_code', $promo_code);
+            update_post_meta($post_id, '_discount', $promo['value']);
+            update_post_meta($post_id, '_discount_type', $promo['type']);
+        }
         $client_portal_url = add_query_arg('token', $token, home_url('/client-area/'));
 
         studio_send_email(get_option('admin_email'), "New Booking Request from $name",
@@ -671,6 +711,7 @@ function studio_booking_handler() {
             '<p><strong>Email:</strong> ' . esc_html($email) . '</p>' .
             ($phone ? '<p><strong>Phone:</strong> ' . esc_html($phone) . '</p>' : '') .
             ($total_hours ? '<p><strong>Hours:</strong> ' . $total_hours . '</p>' : '') .
+            ($promo ? '<p><strong>Promo:</strong> ' . esc_html($promo_code) . ' (' . ($promo['type'] === 'percent' ? number_format($promo['value'], 2) . '% off' : '$' . number_format($promo['value'], 2) . ' off') . ') — discount pre-filled</p>' : ($promo_code ? '<p><strong>Promo entered (no match):</strong> ' . esc_html($promo_code) . '</p>' : '')) .
             ($notes ? '<p><strong>Notes:</strong> ' . esc_html($notes) . '</p>' : ''));
 
         studio_send_email($email, "Booking Request Received",
@@ -682,66 +723,6 @@ function studio_booking_handler() {
     exit;
 }
 add_action('init', 'studio_booking_handler', 99);
-
-/* ----------------------------------------------
-   BOOKING ADMIN ACTIONS (with nonce verification)
-   ---------------------------------------------- */
-function studio_booking_action() {
-    if (!current_user_can('manage_options')) return;
-
-    if (isset($_GET['studio_booking_approve'])) {
-        if (!wp_verify_nonce($_GET['_wpnonce'] ?? '', 'studio_booking_approve_' . intval($_GET['studio_booking_approve']))) {
-            wp_die('Security check failed');
-        }
-        $id = intval($_GET['studio_booking_approve']);
-        if (isset($_GET['co_rate']) && isset($_GET['co_hours'])) {
-            $co_rate = floatval($_GET['co_rate']);
-            $co_hours = floatval($_GET['co_hours']);
-            update_post_meta($id, '_total_hours', $co_hours);
-            studio_do_approve($id, 0, 'percent', $co_rate);
-        } else {
-            studio_do_approve($id, 0, 'percent');
-        }
-        wp_redirect(admin_url('edit.php?post_type=studio_booking'));
-        exit;
-    }
-
-    if (isset($_GET['studio_booking_decline'])) {
-        if (!wp_verify_nonce($_GET['_wpnonce'] ?? '', 'studio_booking_decline_' . intval($_GET['studio_booking_decline']))) {
-            wp_die('Security check failed');
-        }
-        $did = intval($_GET['studio_booking_decline']);
-        update_post_meta($did, '_status', 'Declined');
-
-        $d_name = get_the_title($did);
-        $d_email = get_post_meta($did, '_client_email', true);
-        if ($d_email) {
-            studio_send_email($d_email, "Booking Request Declined",
-                '<p>Hi ' . esc_html($d_name) . ',</p>' .
-                '<p>We regret that we are unable to accommodate your booking request at this time.</p>');
-        }
-        studio_send_email(get_option('admin_email'), "Booking Declined — {$d_name}",
-            '<p>Booking for <strong>' . esc_html($d_name) . '</strong> has been declined.</p>');
-
-        wp_redirect(admin_url('edit.php?post_type=studio_booking'));
-        exit;
-    }
-}
-add_action('admin_init', 'studio_booking_action');
-
-function studio_counter_offer_meta_callback($post) {
-    $status = get_post_meta($post->ID, '_status', true) ?: 'New';
-    if ($status === 'Approved' || $status === 'Declined') return;
-    ?>
-    <p style="font-size:12px;color:#666;margin-bottom:12px;">Send a counter offer to the client before approving.</p>
-    <p><label>Counter Rate ($/hr): <input type="number" step="0.01" name="co_rate" value="<?php echo esc_attr(get_post_meta($post->ID, '_counter_rate', true) ?: '75'); ?>" style="width:100%;"></label></p>
-    <p><label>Counter Hours: <input type="number" step="0.25" name="co_hours" value="<?php echo esc_attr(get_post_meta($post->ID, '_counter_hours', true) ?: get_post_meta($post->ID, '_total_hours', true)); ?>" style="width:100%;"></label></p>
-    <p><label>Note to Client: <textarea name="co_message" rows="3" style="width:100%;"><?php echo esc_textarea(get_post_meta($post->ID, '_counter_message', true)); ?></textarea></label></p>
-    <?php
-    wp_nonce_field('studio_counter_offer', '_co_nonce');
-    echo '<input type="hidden" name="studio_counter_offer" value="1">';
-    submit_button('Send Counter Offer', 'secondary', 'submit_counter', false);
-}
 
 /* ----------------------------------------------
    INVOICE SYSTEM
@@ -802,6 +783,48 @@ function studio_invoice_adjustments_callback($post) {
             <?php endforeach; ?>
         </select>
     </p>
+    <?php if ($booking_id > 0) :
+        $bk_booking = get_post($booking_id);
+        if ($bk_booking && $bk_booking->post_type === 'studio_booking') :
+            $bk_email = get_post_meta($booking_id, '_client_email', true);
+            $bk_token = get_post_meta($booking_id, '_access_token', true) ?: '';
+            $portal_url = $bk_token ? add_query_arg('token', $bk_token, home_url('/client-area/')) : '';
+            ?>
+            <p style="background:#f6f6f6;border:1px solid #e0e0e0;border-radius:8px;padding:12px 16px;margin:12px 0;">
+                <strong style="font-size:12px;text-transform:uppercase;letter-spacing:0.05em;color:#666;">Client Access — share with the client anytime</strong>
+                <div style="margin-top:8px;font-size:0.9rem;">
+                    Booking reference: <code style="background:#fff;padding:2px 6px;border-radius:4px;">#<?php echo esc_html($booking_id); ?></code> &nbsp;·&nbsp; Email: <?php echo $bk_email ? esc_html($bk_email) : '<em>none stored</em>'; ?>
+                </div>
+                <?php if ($portal_url) : ?>
+                <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                    <input type="text" readonly value="<?php echo esc_attr($portal_url); ?>"
+                        style="flex:1;min-width:240px;font-size:0.8rem;font-family:monospace;padding:6px 8px;border:1px solid #ddd;border-radius:6px;background:#fff;">
+                    <button type="button" class="button" onclick="var i=this.parentNode.querySelector('input');i.select();document.execCommand('copy');this.textContent='Copied!';setTimeout(function(){this.textContent='Copy Link';},1500);"
+                        style="white-space:nowrap;">Copy Link</button>
+                </div>
+                <?php endif; ?>
+            </p>
+        <?php
+        endif;
+    else :
+        $inv_ce = get_post_meta($post->ID, '_client_email', true);
+        $inv_token = get_post_meta($post->ID, '_access_token', true) ?: '';
+        if ($inv_ce || $inv_token) :
+            $inv_portal = $inv_token ? add_query_arg('token', $inv_token, home_url('/client-area/')) : '';
+            ?>
+            <p style="background:#f6f6f6;border:1px solid #e0e0e0;border-radius:8px;padding:12px 16px;margin:12px 0;">
+                <strong style="font-size:12px;text-transform:uppercase;letter-spacing:0.05em;color:#666;">Client Access</strong>
+                <div style="margin-top:8px;font-size:0.9rem;">Invoice reference: <code style="background:#fff;padding:2px 6px;border-radius:4px;">#<?php echo esc_html($post->ID); ?></code> &nbsp;·&nbsp; Email: <?php echo $inv_ce ? esc_html($inv_ce) : '<em>none stored</em>'; ?></div>
+                <?php if ($inv_portal) : ?>
+                <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                    <input type="text" readonly value="<?php echo esc_attr($inv_portal); ?>"
+                        style="flex:1;min-width:240px;font-size:0.8rem;font-family:monospace;padding:6px 8px;border:1px solid #ddd;border-radius:6px;background:#fff;">
+                    <button type="button" class="button" onclick="var i=this.parentNode.querySelector('input');i.select();document.execCommand('copy');this.textContent='Copied!';setTimeout(function(){this.textContent='Copy Link';},1500);"
+                        style="white-space:nowrap;">Copy Link</button>
+                </div>
+                <?php endif; ?>
+            </p>
+        <?php endif; endif; ?>
     <h3>Invoice Line Items</h3>
     <table class="widefat striped" id="studio-invoice-line-items">
         <thead><tr><th>Description</th><th>Qty / Hours</th><th>Rate</th><th></th></tr></thead>
@@ -1153,6 +1176,9 @@ function studio_expense_meta_boxes() {
         $tax_cat = get_post_meta($post->ID, '_tax_category', true);
         $deductible = get_post_meta($post->ID, '_tax_deductible', true);
         $receipt_url = get_post_meta($post->ID, '_receipt_url', true);
+        $payee = get_post_meta($post->ID, '_payee_name', true);
+        $payee_tin = get_post_meta($post->ID, '_payee_tin', true);
+        $payee_1099 = get_post_meta($post->ID, '_payee_1099', true);
         $booking_id = intval(get_post_meta($post->ID, '_booking_id', true));
         $billable = get_post_meta($post->ID, '_billable_to_client', true);
         $bookings = get_posts(['post_type' => 'studio_booking', 'post_status' => 'publish', 'numberposts' => -1, 'orderby' => 'date', 'order' => 'DESC']);
@@ -1171,6 +1197,9 @@ function studio_expense_meta_boxes() {
                 <option value="<?php echo esc_attr($c); ?>" <?php selected($current, $c); ?>><?php echo esc_html($c); ?></option>
             <?php endforeach; ?>
         </select></label></p>
+        <p><label>Payee / Vendor: <input type="text" name="_payee_name" value="<?php echo esc_attr($payee); ?>" placeholder="Who did you pay?" style="width:100%;"></label></p>
+        <p><label>Payee TIN (for 1099): <input type="text" name="_payee_tin" value="<?php echo esc_attr($payee_tin); ?>" placeholder="SSN / EIN" style="width:100%;"></label></p>
+        <p><label><input type="checkbox" name="_payee_1099" value="1" <?php checked($payee_1099, '1'); ?>> Non-employee vendor (1099-eligible)</label></p>
         <hr style="margin:12px 0;border-color:#ddd;">
         <p><label>Tax Category: <select name="_tax_category" style="width:100%;">
             <option value="">Select...</option>
@@ -1200,6 +1229,12 @@ function studio_save_expense_meta($post_id) {
     if (isset($_POST['_tax_category'])) update_post_meta($post_id, '_tax_category', sanitize_text_field($_POST['_tax_category']));
     if (isset($_POST['_tax_deductible'])) update_post_meta($post_id, '_tax_deductible', '1');
     elseif (!isset($_POST['_tax_deductible'])) delete_post_meta($post_id, '_tax_deductible');
+    if (isset($_POST['_payee_name'])) update_post_meta($post_id, '_payee_name', sanitize_text_field($_POST['_payee_name']));
+    else delete_post_meta($post_id, '_payee_name');
+    if (isset($_POST['_payee_tin'])) update_post_meta($post_id, '_payee_tin', sanitize_text_field($_POST['_payee_tin']));
+    else delete_post_meta($post_id, '_payee_tin');
+    if (isset($_POST['_payee_1099'])) update_post_meta($post_id, '_payee_1099', '1');
+    elseif (!isset($_POST['_payee_1099'])) delete_post_meta($post_id, '_payee_1099');
     if (isset($_POST['_receipt_url'])) update_post_meta($post_id, '_receipt_url', esc_url_raw($_POST['_receipt_url']));
 }
 add_action('save_post_studio_expense', 'studio_save_expense_meta');
@@ -1293,32 +1328,24 @@ function studio_booking_actions_meta_callback($post) {
     $status = get_post_meta($post->ID, '_status', true) ?: 'New';
     echo '<p><strong>Status:</strong> ' . esc_html($status) . '</p>';
     $invoice_id = intval(get_post_meta($post->ID, '_invoice_id', true));
-    if ($invoice_id) echo '<p><a href="' . esc_url(get_edit_post_link($invoice_id)) . '" class="button" style="width:100%;text-align:center;">Review Invoice #' . $invoice_id . '</a></p>';
+    if ($invoice_id && get_post_status($invoice_id) !== 'trash') {
+        echo '<p><a href="' . esc_url(get_edit_post_link($invoice_id)) . '" class="button" style="width:100%;text-align:center;">Review Invoice #' . $invoice_id . '</a></p>';
+        $pdf_nonce = wp_create_nonce('studio_invoice_print_' . $invoice_id);
+        $pdf_url = admin_url("admin-post.php?action=studio_invoice_print&post_id={$invoice_id}&_wpnonce=" . $pdf_nonce);
+        echo '<p style="text-align:center;margin-top:4px;"><a href="' . esc_url($pdf_url) . '" target="_blank" style="font-size:12px;">View Invoice PDF &#8594;</a></p>';
+    }
     if ($status === 'New' || $status === 'Pending') {
-        $approve_nonce = wp_create_nonce('studio_booking_approve_' . $post->ID);
-        $decline_nonce = wp_create_nonce('studio_booking_decline_' . $post->ID);
-        $approve_url = admin_url("admin-post.php?action=studio_booking_quick_approve&post_id={$post->ID}&_wpnonce={$approve_nonce}");
-        $decline_url = admin_url("admin-post.php?action=studio_booking_quick_decline&post_id={$post->ID}&_wpnonce={$decline_nonce}");
-        echo '<p><a href="' . esc_url($approve_url) . '" class="button button-primary" style="width:100%;text-align:center;">Approve</a></p>';
-        echo '<p><a href="' . esc_url($decline_url) . '" class="button" style="width:100%;text-align:center;">Decline</a></p>';
-
-        $disc = floatval(get_post_meta($post->ID, '_discount', true));
-        $dtype = get_post_meta($post->ID, '_discount_type', true) ?: 'percent';
-        $disc_nonce = wp_create_nonce('studio_booking_approve_discount_' . $post->ID);
-        echo '<hr style="margin:12px 0;border:none;border-top:1px solid #e0e0e0;">';
-        echo '<p style="margin-bottom:6px;"><a href="#" onclick="return confirm(\'Approve this booking now? An invoice will be created and the client will be emailed a PayPal deposit link.\')"><strong style="font-size:12px;">Approve with Discount</strong></a></p>';
-        echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '">';
-        echo '<input type="hidden" name="action" value="studio_booking_approve_discount">';
-        echo '<input type="hidden" name="post_id" value="' . esc_attr($post->ID) . '">';
-        echo '<input type="hidden" name="approve_discount_nonce" value="' . esc_attr($disc_nonce) . '">';
-        echo '<p style="margin:2px 0;"><label style="font-size:11px;">Type<br><select name="approve_discount_type" style="width:100%;">
-            <option value="percent" ' . selected($dtype, 'percent', false) . '>Percent (%)</option>
-            <option value="flat" ' . selected($dtype, 'flat', false) . '>Flat ($)</option>
-        </select></label></p>';
-        echo '<p style="margin:2px 0;"><label style="font-size:11px;">Value<br><input type="number" step="0.01" min="0" name="approve_discount" value="' . esc_attr($disc ?: '') . '" placeholder="e.g. 10" style="width:100%;"></label></p>';
-        echo '<p><button type="submit" class="button button-primary" style="width:100%;min-width:0;padding:6px 10px;font-size:12px;">Approve Now</button></p>';
-        echo '<p><em style="font-size:10px;color:#888;">Leave value blank for full price.</em></p>';
-        echo '</form>';
+        // Mode-aware quick approve (hidden in Counter-Offer mode — that goes through the portal)
+        $amode = get_post_meta($post->ID, '_rate_mode', true) ?: 'standard';
+        if ($amode !== 'counter') {
+            $approve_nonce = wp_create_nonce('studio_booking_approve_' . $post->ID);
+            $approve_url   = admin_url("admin-post.php?action=studio_booking_quick_approve&post_id={$post->ID}&_wpnonce={$approve_nonce}");
+            echo '<hr style="margin:12px 0;border:none;border-top:1px solid #e0e0e0;">';
+            echo '<p><a href="' . esc_url($approve_url) . '" class="button" onclick="return confirm(\'Approve this booking at the saved rate?\')" style="width:100%;text-align:center;color:#fff;background:#46b450;border-color:#3d9c45;">Approve</a></p>';
+        }
+        $decline_nonce = wp_create_nonce('studio_booking_quick_decline_' . $post->ID);
+        $decline_url   = admin_url("admin-post.php?action=studio_booking_quick_decline&post_id={$post->ID}&_wpnonce={$decline_nonce}");
+        echo '<p><a href="' . esc_url($decline_url) . '" class="button" onclick="return confirm(\'Decline this booking?\')" style="width:100%;text-align:center;color:#fff;background:#cf2e5e;border-color:#b52852;">Decline</a></p>';
     } elseif ($status === 'Approved') {
         echo '<p style="margin-bottom:6px;"><strong style="font-size:12px;">Save &amp; Resend</strong></p>';
         echo '<p><em style="font-size:11px;color:#666;">In Booking Details, select “Email updated booking details” and click Update to save and send the client a fresh deposit link.</em></p>';
@@ -1326,10 +1353,10 @@ function studio_booking_actions_meta_callback($post) {
         $reset_nonce = wp_create_nonce('studio_booking_reset_' . $post->ID);
         $reset_url = admin_url("admin-post.php?action=studio_booking_reset&post_id={$post->ID}&_wpnonce=$reset_nonce");
         echo '<p><a href="' . esc_url($reset_url) . '" class="button" style="width:100%;text-align:center;">Reset to Pending</a></p>';
-    } elseif ($status === 'Declined') {
+    } elseif ($status === 'Declined' || $status === 'Counter-Offer') {
         $reset_nonce = wp_create_nonce('studio_booking_reset_' . $post->ID);
         $reset_url = admin_url("admin-post.php?action=studio_booking_reset&post_id={$post->ID}&_wpnonce=$reset_nonce");
-        echo '<p><a href="' . esc_url($reset_url) . '" class="button" style="width:100%;text-align:center;">Reset to Pending</a></p>';
+        echo '<p><a href="' . esc_url($reset_url) . '" class="button" onclick="return confirm(\'Reset this booking to Pending?\')" style="width:100%;text-align:center;">Reset to Pending</a></p>';
     }
 }
 
@@ -1418,49 +1445,6 @@ function studio_save_equipment_meta($post_id) {
 add_action('save_post_studio_equipment', 'studio_save_equipment_meta');
 
 /* ----------------------------------------------
-   COUNTER-OFFER HANDLER
-   ---------------------------------------------- */
-function studio_counter_offer_handler() {
-	if (!current_user_can('manage_options')) return;
-	if (!isset($_POST['studio_counter_offer']) || !wp_verify_nonce($_POST['_co_nonce'] ?? '', 'studio_counter_offer')) return;
-
-	$booking_id = intval($_POST['booking_id']);
-	if (!$booking_id) return;
-
-	$new_rate   = floatval($_POST['co_rate'] ?? 0);
-	$new_hours  = floatval($_POST['co_hours'] ?? get_post_meta($booking_id, '_total_hours', true));
-	$message    = sanitize_textarea_field($_POST['co_message'] ?? '');
-
-	update_post_meta($booking_id, '_status', 'Counter-Offer');
-	update_post_meta($booking_id, '_counter_rate', $new_rate);
-	update_post_meta($booking_id, '_counter_hours', $new_hours);
-	update_post_meta($booking_id, '_counter_message', $message);
-
-	studio_cache_flush('studio_dashboard_overview');
-
-	$client_email = get_post_meta($booking_id, '_client_email', true);
-	$name = get_the_title($booking_id);
-    $token = get_post_meta($booking_id, '_access_token', true) ?: studio_generate_token($booking_id);
-
-    if ($client_email) {
-        $accept_url = home_url("/booking-action/?action=accept_counter&booking_id=$booking_id&token=$token");
-        $decline_url = home_url("/booking-action/?action=decline_counter&booking_id=$booking_id&token=$token");
-        studio_send_email($client_email, "Counter Offer for Your Booking",
-            '<p>Hi ' . esc_html($name) . ', we have a counter offer for your booking:</p>' .
-            '<p><strong>New total:</strong> $' . number_format((float) $new_rate * (float) $new_hours, 2) . '</p>' .
-            ($message ? '<p><strong>Note:</strong> ' . esc_html($message) . '</p>' : '') .
-            '<p><a href="' . $accept_url . '" style="display:inline-block;padding:12px 32px;background:#d4a574;color:#0a0a0a;text-decoration:none;border-radius:8px;font-weight:bold;">Accept Counter Offer</a></p>' .
-            '<p style="margin-top:12px;"><a href="' . $decline_url . '" style="color:#888;">Decline Counter Offer</a></p>');
-
-        studio_send_email(get_option('admin_email'), "Counter Offer Sent — Booking #{$booking_id}",
-            '<p>Counter offer for <strong>' . esc_html($name) . '</strong>: $' . number_format($new_rate, 2) . '/hr × ' . $new_hours . ' hrs.</p>');
-    }
-    wp_redirect(admin_url('edit.php?post_type=studio_booking'));
-    exit;
-}
-add_action('admin_init', 'studio_counter_offer_handler');
-
-/* ----------------------------------------------
    BOOKING ACTION HANDLER (Client-Facing, with token verification)
    ---------------------------------------------- */
 function studio_booking_action_handler() {
@@ -1533,8 +1517,7 @@ function studio_booking_action_handler() {
         $booking_id = intval($_GET['booking_id'] ?? 0);
         $token = sanitize_text_field($_GET['token'] ?? '');
         if ($booking_id && studio_verify_token($booking_id, $token)) {
-            $new_hours = floatval(get_post_meta($booking_id, '_counter_hours', true));
-            update_post_meta($booking_id, '_total_hours', $new_hours);
+            update_post_meta($booking_id, '_rate_mode', 'counter');
             studio_do_approve($booking_id, 0, 'percent');
             wp_redirect(home_url('/booking/?booking=sent'));
             exit;
@@ -1646,18 +1629,33 @@ function studio_do_approve($post_id, $discount = 0, $discount_type = 'percent', 
     if (!get_post_meta($post_id, '_job_status', true)) studio_set_booking_job_status($post_id, 'Scheduled', false);
 
     $service = get_post_meta($post_id, '_service', true);
+    $rate_info = studio_rate_for_service($service);
+    $service_label = $rate_info['label'] ?: $service;
     $total_hours = floatval(get_post_meta($post_id, '_total_hours', true));
     $name = get_the_title($post_id);
     $client_email = get_post_meta($post_id, '_client_email', true);
 
-    if ($override_rate !== null) {
-        $rate = $override_rate;
-    } else {
-        $rate_info = studio_rate_for_service($service);
-        $rate = $rate_info['rate'];
-        if (!$rate_info['hourly'] && $rate > 0) $total_hours = 1;
-        if ($rate === 0) $total_hours = 0;
+    // Rate mode: standard | custom | counter ($override_rate is the legacy fallback for custom)
+    $mode = get_post_meta($post_id, '_rate_mode', true) ?: ($override_rate !== null ? 'custom' : 'standard');
+    $qty = max(1, $total_hours);
+    if ($mode === 'standard') {
+        $amount = $rate_info['rate'];
+        if (!$rate_info['hourly'] && $amount > 0) $qty = 1;
+        if ($amount === 0) $qty = 0;
+    } elseif ($mode === 'custom') {
+        $amount = $override_rate !== null ? $override_rate : floatval(get_post_meta($post_id, '_custom_rate', true));
+        $cbasis = get_post_meta($post_id, '_custom_basis', true);
+        if (!in_array($cbasis, ['hr', 'flat'], true)) $cbasis = $rate_info['hourly'] ? 'hr' : 'flat';
+        if ($cbasis === 'flat') $qty = 1; // amount is a fixed total
+    } else { // counter: basis selector wins; service type is only the default
+        $amount = floatval(get_post_meta($post_id, '_counter_rate', true));
+        $xnbasis = get_post_meta($post_id, '_counter_basis', true);
+        if (!in_array($xnbasis, ['hr', 'flat'], true)) $xnbasis = $rate_info['hourly'] ? 'hr' : 'flat';
+        if ($xnbasis === 'flat') $qty = 1; // amount is a fixed total
     }
+    $rate = $amount;
+    studio_log_error('APPROVE: rate resolution', ['post_id' => $post_id, 'mode' => $mode, 'amount' => $amount, 'qty' => $qty, 'override_rate' => $override_rate, 'saved_custom_rate' => get_post_meta($post_id, '_custom_rate', true), 'saved_custom_basis' => get_post_meta($post_id, '_custom_basis', true), 'saved_rate_mode' => get_post_meta($post_id, '_rate_mode', true), 'total_hours' => $total_hours]);
+    $line_desc = $service_label . ($mode === 'counter' ? (' (counter' . ($xnbasis === 'hr' ? ' rate' : ' total') . ')') : ($mode === 'custom' && $cbasis === 'flat' ? ' (custom total)' : ''));
 
     update_post_meta($post_id, '_rate', $rate);
 
@@ -1684,12 +1682,12 @@ function studio_do_approve($post_id, $discount = 0, $discount_type = 'percent', 
         }
     }
 
-    $subtotal = $rate * $total_hours;
+    $subtotal = $rate * $qty;
     $discount_amount = 0;
-    if ($discount > 0) {
-        $discount_amount = ($discount_type === 'percent') ? $subtotal * ($discount / 100) : $discount;
-    }
-    $total = max(0, $subtotal - $discount_amount);
+    if ($discount > 0) $discount_amount = ($discount_type === 'flat') ? min($subtotal, $discount) : min($subtotal, $subtotal * $discount / 100);
+    $tax_rate = max(0, (float) get_post_meta($post_id, '_tax_rate', true));
+    $tax_amount = max(0, $subtotal - $discount_amount) * $tax_rate / 100;
+    $total = max(0, $subtotal - $discount_amount) + $tax_amount;
     $deposit = round($total * 0.5, 2);
     $token = get_post_meta($post_id, '_access_token', true) ?: studio_generate_token($post_id);
     $client_portal_url = add_query_arg('token', $token, home_url('/client-area/'));
@@ -1698,27 +1696,45 @@ function studio_do_approve($post_id, $discount = 0, $discount_type = 'percent', 
     if ($total <= 0) {
         if ($client_email) {
             studio_send_email($client_email, "Booking Approved!",
-                '<p>Great news, ' . esc_html($name) . '! Your booking for <strong>' . esc_html($service) . '</strong> has been approved.</p>' .
+                '<p>Great news, ' . esc_html($name) . '! Your booking for <strong>' . esc_html($service_label) . '</strong> has been approved.</p>' .
                 '<p>This is a complimentary session. No payment required.</p>' .
                 '<p><a href="' . esc_url($client_portal_url) . '">View your booking status and session details</a></p>');
         }
         return;
     }
 
-    $invoice_id = wp_insert_post(['post_type' => 'studio_invoice', 'post_title' => "Invoice for $name", 'post_status' => 'publish']);
-    if ($invoice_id) {
+    // Re-approve: update the existing invoice in place instead of creating a duplicate
+    $invoice_id = intval(get_post_meta($post_id, '_invoice_id', true));
+    // User manually deleted the invoice -> drop the stale link and create a fresh one below
+    if ($invoice_id && get_post_status($invoice_id) === 'trash') {
+        delete_post_meta($post_id, '_invoice_id');
+        $invoice_id = 0;
+    }
+    if ($invoice_id && get_post($invoice_id)) {
+        $existing_status = get_post_meta($invoice_id, '_status', true);
+        if (!in_array($existing_status, ['Void'], true)) {
+            wp_update_post(['ID' => $invoice_id, 'post_title' => "Invoice for $name", 'post_status' => 'publish']);
+        }
+    } else {
+        $invoice_id = wp_insert_post(['post_type' => 'studio_invoice', 'post_title' => "Invoice for $name", 'post_status' => 'publish']);
+    }
+    if ($invoice_id && !is_wp_error($invoice_id)) {
         $meta = [
             '_booking_id' => $post_id, '_client_email' => $client_email, '_client_name' => $name,
             '_client_phone' => get_post_meta($post_id, '_client_phone', true),
             '_event_date' => $first_slot['date'] ?? '', '_start_time' => $first_slot['start'] ?? '',
             '_end_time' => $first_slot['end'] ?? '', '_venue' => $location,
-            '_service_type' => $service, '_service' => $service, '_rate' => $rate, '_total_hours' => $total_hours,
-            '_line_items' => [['desc' => $service, 'qty' => $total_hours, 'rate' => $rate]],
+            '_service_type' => $service, '_service' => $service_label, '_rate' => $rate, '_total_hours' => $qty,
+            '_line_items' => [['desc' => $line_desc, 'qty' => $qty, 'rate' => $rate]],
             '_subtotal' => $subtotal, '_discount' => $discount, '_discount_type' => $discount_type,
-            '_discount_amount' => $discount_amount, '_total' => $total, '_deposit' => $deposit,
-            '_deposit_paid' => 0, '_paid_amount' => 0, '_status' => 'Draft',
+            '_discount_amount' => $discount_amount, '_tax_rate' => $tax_rate, '_tax_collected' => $tax_amount,
+            '_total' => $total, '_deposit' => $deposit,
+            /* Preserve money already recorded — re-approve must never wipe payments */
+            '_deposit_paid' => floatval(get_post_meta($invoice_id, '_deposit_paid', true) ?: 0),
+            '_paid_amount' => floatval(get_post_meta($invoice_id, '_paid_amount', true) ?: 0),
+            '_status' => (floatval(get_post_meta($invoice_id, '_paid_amount', true) ?: 0) > 0) ? (get_post_meta($invoice_id, '_status', true) ?: 'Partial') : 'Draft',
             '_due_date' => date('Y-m-d', strtotime('+7 days')),
-            '_created_at' => current_time('mysql'),
+            '_created_at' => get_post_meta($invoice_id, '_created_at', true) ?: current_time('mysql'),
         ];
         foreach ($meta as $k => $v) update_post_meta($invoice_id, $k, $v);
         update_post_meta($post_id, '_invoice_id', $invoice_id);
@@ -1738,14 +1754,14 @@ function studio_do_approve($post_id, $discount = 0, $discount_type = 'percent', 
             $gcal_start = $date_str . 'T' . $start_time . '00';
             $gcal_end = $date_str . 'T' . $end_time . '00';
             $gcal_url = "https://calendar.google.com/calendar/render?action=TEMPLATE"
-                . "&text=" . urlencode($service . " - " . $name)
+                . "&text=" . urlencode($service_label . " - " . $name)
                 . "&dates=" . $gcal_start . "/" . $gcal_end
                 . "&details=" . urlencode("Session with Roux's Audio Production");
             $calendar_section = '<p style="margin-top:16px;"><a href="' . $gcal_url . '" style="display:inline-block;padding:10px 24px;border:1px solid #d4a574;color:#d4a574;text-decoration:none;border-radius:8px;margin-right:8px;">Add to Google Calendar</a></p>';
         }
 
         studio_send_email($client_email, "Booking Approved!",
-            '<p>Great news, ' . esc_html($name) . '! Your booking for <strong>' . esc_html($service) . '</strong> has been approved.</p>' .
+            '<p>Great news, ' . esc_html($name) . '! Your booking for <strong>' . esc_html($service_label) . '</strong> has been approved.</p>' .
             '<p><strong>Total:</strong> $' . number_format($total, 2) . '</p>' .
             '<p><strong>50% Deposit Required:</strong> $' . number_format($deposit, 2) . '</p>' .
         '<p><a href="' . $deposit_url . '" style="display:inline-block;padding:12px 32px;background:#d4a574;color:#0a0a0a;text-decoration:none;border-radius:8px;font-weight:bold;">Pay Deposit via PayPal</a></p>' .
@@ -1753,10 +1769,38 @@ function studio_do_approve($post_id, $discount = 0, $discount_type = 'percent', 
             $calendar_section);
 
         studio_send_email(get_option('admin_email'), "Booking Approved — {$name}",
-            '<p>Booking for <strong>' . esc_html($name) . '</strong> (<strong>' . esc_html($service) . '</strong>) has been approved.</p>' .
+            '<p>Booking for <strong>' . esc_html($name) . '</strong> (<strong>' . esc_html($service_label) . '</strong>) has been approved.</p>' .
             '<p><strong>Total:</strong> $' . number_format($total, 2) . ' | <strong>Deposit:</strong> $' . number_format($deposit, 2) . '</p>');
     }
 }
+
+/* ----------------------------------------------
+    BOOKING CLEANUP: trash/delete booking -> void invoice + remove gig
+    ---------------------------------------------- */
+function studio_booking_cleanup_linked($booking_id, $cleanup = true) {
+    if (get_post_type($booking_id) !== 'studio_booking') return;
+    if ($cleanup) {
+        $invoice_id = intval(get_post_meta($booking_id, '_invoice_id', true));
+        if ($invoice_id) {
+            $inv = get_post($invoice_id);
+            if ($inv) {
+                // Fully paid invoices: mark Void (keep for accounting); otherwise trash
+                $paid = (float) get_post_meta($invoice_id, '_paid_amount', true);
+                $total = (float) get_post_meta($invoice_id, '_total', true);
+                if ($paid >= $total && $total > 0) {
+                    update_post_meta($invoice_id, '_status', 'Void');
+                } else {
+                    wp_trash_post($invoice_id);
+                }
+            }
+        }
+        $gig_id = intval(get_post_meta($booking_id, '_gig_id', true));
+        if ($gig_id && get_post($gig_id)) wp_delete_post($gig_id, true);
+        studio_cache_flush('studio_dashboard_overview');
+    }
+}
+add_action('trashed_post', 'studio_booking_cleanup_linked', 10, 2);
+add_action('deleted_post', 'studio_booking_cleanup_linked', 10, 2);
 
 /* ----------------------------------------------
     PERFORMANCE: Transient cache helper
@@ -2123,9 +2167,12 @@ function studio_booking_columns($columns) {
     foreach ($columns as $k => $v) {
         $new[$k] = $v;
         if ($k === 'title') {
+            $new['bk_client'] = 'Client';
+            $new['bk_session'] = 'Session';
+            $new['bk_total'] = 'Total';
             $new['status'] = 'Status';
             $new['service'] = 'Service';
-            $new['date_col'] = 'Date';
+            $new['date_col'] = 'Submitted';
         }
     }
     return $new;
@@ -2134,6 +2181,28 @@ add_filter('manage_studio_booking_posts_columns', 'studio_booking_columns');
 
 function studio_booking_column_data($column, $post_id) {
     switch ($column) {
+        case 'bk_client':
+            $email = get_post_meta($post_id, '_client_email', true);
+            $phone = get_post_meta($post_id, '_client_phone', true);
+            echo $email ? '<a href="mailto:' . esc_attr($email) . '">' . esc_html($email) . '</a>' : '&mdash;';
+            if ($phone) echo '<br><span style="font-size:0.8rem;color:#666;">' . esc_html($phone) . '</span>';
+            break;
+        case 'bk_session':
+            $slots = get_post_meta($post_id, '_booking_slots', true);
+            if (is_array($slots) && !empty($slots[0]['date'])) {
+                $first = $slots[0];
+                $d = date_i18n('M j, Y', strtotime($first['date']));
+                $t = trim(($first['start'] ?? '') . '–' . ($first['end'] ?? ''));
+                echo esc_html($d . ($t ? ' · ' . $t : ''));
+                if (count($slots) > 1) echo ' <span style="font-size:0.8rem;color:#666;">+' . (count($slots) - 1) . ' more</span>';
+            } else {
+                echo '&mdash;';
+            }
+            break;
+        case 'bk_total':
+            $total = get_post_meta($post_id, '_total', true);
+            echo $total !== '' ? '$' . number_format((float)$total, 2) : '&mdash;';
+            break;
         case 'status':
             $st = get_post_meta($post_id, '_status', true) ?: 'New';
             echo studio_badge_html($st);
@@ -2148,11 +2217,74 @@ function studio_booking_column_data($column, $post_id) {
 }
 add_action('manage_studio_booking_posts_custom_column', 'studio_booking_column_data', 10, 2);
 
+/* ----------------------------------------------
+   ADMIN COLUMNS — GIGS
+   ---------------------------------------------- */
+function studio_gig_columns($columns) {
+    $new = [];
+    foreach ($columns as $k => $v) {
+        $new[$k] = $v;
+        if ($k === 'title') {
+            $new['gig_date'] = 'Date';
+            $new['gig_time'] = 'Time';
+            $new['gig_venue'] = 'Venue';
+            $new['gig_pay'] = 'Pay';
+            $new['gig_booking'] = 'Booking';
+        }
+    }
+    return $new;
+}
+add_filter('manage_studio_gig_posts_columns', 'studio_gig_columns');
+
+function studio_gig_column_data($column, $post_id) {
+    switch ($column) {
+        case 'gig_date':
+            $d = get_post_meta($post_id, '_gig_date', true);
+            echo $d ? esc_html(date_i18n('M j, Y', strtotime($d))) : '&mdash;';
+            break;
+        case 'gig_time':
+            echo esc_html(get_post_meta($post_id, '_gig_time', true) ?: '&mdash;');
+            break;
+        case 'gig_venue':
+            echo esc_html(get_post_meta($post_id, '_gig_venue', true) ?: '&mdash;');
+            break;
+        case 'gig_pay':
+            $pay = get_post_meta($post_id, '_gig_pay', true);
+            echo $pay !== '' ? '$' . number_format((float)$pay, 2) : '&mdash;';
+            break;
+        case 'gig_booking':
+            $bid = get_post_meta($post_id, '_booking_id', true);
+            if ($bid && get_post_type($bid) === 'studio_booking') {
+                echo '<a href="' . esc_url(get_edit_post_link($bid)) . '">' . esc_html(get_the_title($bid)) . '</a>';
+            } else {
+                echo '&mdash;';
+            }
+            break;
+    }
+}
+add_action('manage_studio_gig_posts_custom_column', 'studio_gig_column_data', 10, 2);
+
 function studio_booking_sortable_columns($columns) {
     $columns['status'] = 'status';
     $columns['date_col'] = 'date_col';
     return $columns;
 }
+function studio_gig_sortable_columns($columns) {
+    $columns['gig_date'] = 'gig_date';
+    $columns['gig_pay'] = 'gig_pay';
+    return $columns;
+}
+add_filter('manage_edit-studio_gig_sortable_columns', 'studio_gig_sortable_columns');
+function studio_gig_sort($query) {
+    if (!is_admin() || !$query->is_main_query()) return;
+    if ($query->get('post_type') !== 'studio_gig') return;
+    $key = $query->get('orderby') === 'gig_date' ? '_gig_date' : ($query->get('orderby') === 'gig_pay' ? '_gig_pay' : false);
+    if ($key) {
+        $query->set('meta_key', $key);
+        $query->set('orderby', $key === '_gig_date' ? 'meta_value' : 'meta_value_num');
+    }
+}
+add_action('pre_get_posts', 'studio_gig_sort');
 add_filter('manage_edit-studio_booking_sortable_columns', 'studio_booking_sortable_columns');
 
 function studio_booking_status_sort($query) {
@@ -2252,11 +2384,15 @@ function studio_booking_row_actions($actions, $post) {
     unset($actions['inline hide-if-no-js']);
 
     if ($status === 'Pending' || $status === 'New') {
-        $approve_nonce = wp_create_nonce('studio_booking_approve_' . $post->ID);
-        $approve_url = admin_url("admin-post.php?action=studio_booking_quick_approve&post_id={$post->ID}&_wpnonce=$approve_nonce");
-        $actions['quick_approve'] = '<a href="' . esc_url($approve_url) . '" style="color:#46b450;font-weight:600;">Approve</a>';
+        // Mode-aware: approves with the saved Rate Mode (standard / custom). Counter mode must go through the client portal.
+        $amode = get_post_meta($post->ID, '_rate_mode', true) ?: 'standard';
+        if ($amode !== 'counter') {
+            $approve_nonce = wp_create_nonce('studio_booking_approve_' . $post->ID);
+            $approve_url = admin_url("admin-post.php?action=studio_booking_quick_approve&post_id={$post->ID}&_wpnonce=$approve_nonce");
+            $actions['quick_approve'] = '<a href="' . esc_url($approve_url) . '" style="color:#46b450;font-weight:600;">Approve</a>';
+        }
 
-        $decline_nonce = wp_create_nonce('studio_booking_decline_' . $post->ID);
+        $decline_nonce = wp_create_nonce('studio_booking_quick_decline_' . $post->ID);
         $decline_url = admin_url("admin-post.php?action=studio_booking_quick_decline&post_id={$post->ID}&_wpnonce=$decline_nonce");
         $actions['quick_decline'] = '<a href="' . esc_url($decline_url) . '" style="color:#cf2e5e;font-weight:600;">Decline</a>';
     }
@@ -2290,25 +2426,6 @@ function studio_booking_quick_approve_handler() {
     exit;
 }
 add_action('admin_post_studio_booking_quick_approve', 'studio_booking_quick_approve_handler');
-
-function studio_booking_approve_discount_handler() {
-    if (!current_user_can('manage_options')) wp_die('Unauthorized');
-    $post_id = intval($_POST['post_id'] ?? 0);
-    if (!isset($_POST['approve_discount_nonce']) || !wp_verify_nonce(sanitize_text_field($_POST['approve_discount_nonce']), 'studio_booking_approve_discount_' . $post_id)) wp_die('Invalid nonce');
-    $status = get_post_meta($post_id, '_status', true) ?: 'New';
-    $redirect = admin_url('edit.php?post_type=studio_booking');
-    if ($post_id <= 0 || !in_array($status, ['New', 'Pending'], true)) {
-        wp_redirect(add_query_arg('booking_action_error', 'not_pending', $redirect));
-        exit;
-    }
-    $discount = floatval($_POST['approve_discount'] ?? 0);
-    $type     = (($_POST['approve_discount_type'] ?? 'percent') === 'flat') ? 'flat' : 'percent';
-    studio_do_approve($post_id, $discount, $type);
-    $msg = $discount > 0 ? ('Booking approved with ' . $type . ' discount applied.') : 'Booking approved.';
-    wp_redirect(add_query_arg(['booking_approved_discount' => $post_id, 'booking_action_msg' => rawurlencode($msg)], $redirect));
-    exit;
-}
-add_action('admin_post_studio_booking_approve_discount', 'studio_booking_approve_discount_handler');
 
 function studio_booking_resend_handler() {
     if (!current_user_can('manage_options')) wp_die('Unauthorized');
@@ -2435,7 +2552,7 @@ add_action('admin_post_studio_booking_resend', 'studio_booking_resend_handler');
 function studio_booking_quick_decline_handler() {
     if (!current_user_can('manage_options')) wp_die('Unauthorized');
     $post_id = intval($_GET['post_id'] ?? 0);
-    if (!isset($_GET['_wpnonce']) || !wp_verify_nonce(sanitize_text_field($_GET['_wpnonce']), 'studio_booking_decline_' . $post_id)) wp_die('Invalid nonce');
+    if (!isset($_GET['_wpnonce']) || !wp_verify_nonce(sanitize_text_field($_GET['_wpnonce']), 'studio_booking_quick_decline_' . $post_id)) wp_die('Invalid nonce');
     update_post_meta($post_id, '_status', 'Declined');
     studio_cache_flush('studio_dashboard_overview');
 
@@ -2459,6 +2576,23 @@ function studio_booking_reset_handler() {
     $post_id = intval($_GET['post_id'] ?? 0);
     if (!isset($_GET['_wpnonce']) || !wp_verify_nonce(sanitize_text_field($_GET['_wpnonce']), 'studio_booking_reset_' . $post_id)) wp_die('Invalid nonce');
     update_post_meta($post_id, '_status', 'Pending');
+    // Trash the linked schedule (gig) so re-approve creates a fresh one
+    $gig_id = intval(get_post_meta($post_id, '_gig_id', true));
+    if ($gig_id && get_post_type($gig_id) === 'studio_gig') {
+        wp_trash_post($gig_id);
+        delete_post_meta($post_id, '_gig_id');
+    }
+    // Reset the linked invoice to Draft — but only if no money was received; paid invoices stay untouched
+    $invoice_id = intval(get_post_meta($post_id, '_invoice_id', true));
+    if ($invoice_id && get_post_type($invoice_id) === 'studio_invoice') {
+        if (get_post_status($invoice_id) === 'trash') {
+            delete_post_meta($post_id, '_invoice_id'); // already deleted by user — drop the stale link
+        } elseif (studio_invoice_paid_amount($invoice_id) <= 0) {
+            update_post_meta($invoice_id, '_status', 'Draft');
+        } else {
+            studio_log_error('RESET: invoice has recorded payments, left untouched', ['invoice_id' => $invoice_id, 'paid' => studio_invoice_paid_amount($invoice_id)]);
+        }
+    }
     studio_cache_flush('studio_dashboard_overview');
     wp_redirect(admin_url("edit.php?post_type=studio_booking&booking_reset=$post_id"));
     exit;
@@ -2515,9 +2649,35 @@ function studio_invoice_row_actions($actions, $post) {
         $actions['quick_paid'] = '<a href="' . esc_url($paid_url) . '" style="color:#2271b1;font-weight:600;">Mark Paid</a>';
     }
 
+    if ($status !== 'Cancelled') {
+        $print_nonce = wp_create_nonce('studio_invoice_print_' . $post->ID);
+        $print_url = admin_url("admin-post.php?action=studio_invoice_print&post_id={$post->ID}&_wpnonce=$print_nonce");
+        $actions['print_pdf'] = '<a href="' . esc_url($print_url) . '" target="_blank" style="color:#b32d2e;font-weight:600;">Print / View PDF</a>';
+    }
+
     return $actions;
 }
 add_filter('post_row_actions', 'studio_invoice_row_actions', 10, 2);
+
+function studio_invoice_print_handler() {
+    if (!current_user_can('manage_options')) wp_die('Unauthorized');
+    $post_id = intval($_GET['post_id'] ?? 0);
+    if (!isset($_GET['_wpnonce']) || !wp_verify_nonce(sanitize_text_field($_GET['_wpnonce']), 'studio_invoice_print_' . $post_id)) wp_die('Invalid nonce');
+    if (!get_post($post_id)) wp_die('Invoice not found.');
+    $path = studio_invoice_pdf_temp_file($post_id);
+    if (!$path || !is_file($path)) {
+        studio_log_error('Invoice PDF generation failed (print)', ['invoice_id' => $post_id]);
+        wp_die('Unable to generate the invoice PDF. Check the site error log and try again.');
+    }
+    header('Content-Type: application/pdf');
+    header('Content-Disposition: inline; filename="invoice-' . $post_id . '.pdf"');
+    header('Content-Length: ' . filesize($path));
+    header('Cache-Control: no-cache, must-revalidate');
+    readfile($path);
+    @unlink($path);
+    exit;
+}
+add_action('admin_post_studio_invoice_print', 'studio_invoice_print_handler');
 
 function studio_invoice_quick_submit_handler() {
     if (!current_user_can('manage_options')) wp_die('Unauthorized');
@@ -2771,17 +2931,17 @@ function studio_pnl_shortcode($atts) {
         $year = intval($atts['year']);
         $start = "$year-01-01";
         $end = "$year-12-31";
-        $label = "P&L Report \u2014 $year";
+        $label = "P&L Report — $year";
     } elseif ($atts['range'] === 'quarter') {
         $quarter = ceil(date('m') / 3);
         $q_start_month = (($quarter - 1) * 3) + 1;
         $start = date('Y') . '-' . str_pad($q_start_month, 2, '0', STR_PAD_LEFT) . '-01';
         $end = date('Y-m-t', strtotime($start . '+2 months'));
-        $label = "P&L Report \u2014 Q$quarter " . date('Y');
+        $label = "P&L Report — Q$quarter " . date('Y');
     } else {
         $start = "{$atts['year']}-{$atts['month']}-01";
         $end = date('Y-m-t', strtotime($start));
-        $label = 'P&L \u2014 ' . date('F Y', strtotime($start));
+        $label = 'P&L — ' . date('F Y', strtotime($start));
     }
 
     $revenue = 0;
@@ -2951,7 +3111,7 @@ function studio_tax_report_shortcode($atts) {
 
     $net_income = $gross_income - $total_expenses;
     $ob = '<div class="glass">';
-    $ob .= '<h3>Tax Summary \u2014 ' . $year . '</h3>';
+    $ob .= '<h3>Tax Summary — ' . $year . '</h3>';
     $ob .= '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin:24px 0;">';
     $ob .= '<div><span style="color:var(--text-muted);font-size:0.8rem;letter-spacing:1px;text-transform:uppercase;display:block;">Gross Income</span><span style="font-size:1.4rem;color:var(--green);font-weight:600;">$' . number_format($gross_income, 2) . '</span></div>';
     $ob .= '<div><span style="color:var(--text-muted);font-size:0.8rem;letter-spacing:1px;text-transform:uppercase;display:block;">Total Expenses</span><span style="font-size:1.4rem;color:var(--red);font-weight:600;">$' . number_format($total_expenses, 2) . '</span></div>';
@@ -2967,6 +3127,80 @@ function studio_tax_report_shortcode($atts) {
         }
     }
 
+    /* 1099-style: actual paid income per client, split by calendar year of payment */
+    $payments = [];
+    foreach ($invoices as $inv) {
+        $paid = studio_invoice_paid_amount($inv->ID);
+        if ($paid <= 0) continue;
+        $client = get_post_meta($inv->ID, '_client_name', true);
+        if (!$client) {
+            $booking_id = intval(get_post_meta($inv->ID, '_booking_id', true));
+            $client = $booking_id ? get_the_title($booking_id) : get_post_meta($inv->ID, '_client_email', true);
+        }
+        $client = $client ?: 'Unknown client';
+        $email = get_post_meta($inv->ID, '_client_email', true);
+        /* Payment year = _paid_date when set, else the invoice date */
+        $paid_date = get_post_meta($inv->ID, '_paid_date', true) ?: get_the_date('Y-m-d', $inv->ID);
+        $pay_year = (int) substr($paid_date, 0, 4);
+        if ($pay_year < 1970) $pay_year = $year;
+        $payments[] = ['year' => $pay_year, 'client' => $client, 'email' => $email, 'amount' => $paid];
+    }
+    if ($payments) {
+        usort($payments, function($a, $b) { return $a['year'] <=> $b['year'] || strcmp($a['client'], $b['client']); });
+        $year_rows = [];
+        $cur_year = 0; $cur_client = '';
+        foreach ($payments as $p) {
+            if ($p['year'] !== $cur_year || $p['client'] !== $cur_client) {
+                $year_rows[] = $p;
+                $cur_year = $p['year']; $cur_client = $p['client'];
+            } else {
+                $year_rows[count($year_rows) - 1]['amount'] += $p['amount'];
+            }
+        }
+        $grand_total = 0;
+        $ob .= '<h4>Income by Client — Schedule C Gross Income (by year received)</h4>';
+        $ob .= '<table style="width:100%;border-collapse:collapse;font-size:0.9rem;"><thead><tr style="border-bottom:1px solid var(--surface-border);text-align:left;"><th style="padding:8px 4px;">Year</th><th>Client</th><th style="text-align:right;">Amount Received</th></tr></thead><tbody>';
+        foreach ($year_rows as $r) {
+            $grand_total += $r['amount'];
+            $ob .= '<tr style="border-bottom:1px solid var(--surface-border);"><td style="padding:8px 4px;">' . (int) $r['year'] . '</td><td>' . esc_html($r['client']) . ($r['email'] ? ' <span style="color:var(--text-muted);font-size:0.8rem;">(' . esc_html($r['email']) . ')</span>' : '') . '</td><td style="text-align:right;">$' . number_format($r['amount'], 2) . '</td></tr>';
+        }
+        $ob .= '</tbody><tfoot><tr><th style="padding:8px 4px;text-align:left;">Total</th><th></th><th style="text-align:right;">$' . number_format($grand_total, 2) . '</th></tr></tfoot></table>';
+        $ob .= '<p style="font-size:0.75rem;color:var(--text-dim);margin-top:8px;">This is money your business received — report it on Schedule C (Form 1040). No 1099 is needed for your own business income. Year = when payment was received (PayPal IPN / paid date).</p>';
+    }
+
+    /* 1099-NEC: vendors/contractors YOU paid, from 1099-eligible expenses */
+    $vendor_totals = [];
+    foreach ($expenses as $ex) {
+        if (get_post_meta($ex->ID, '_payee_1099', true) !== '1') continue;
+        $amt = floatval(get_post_meta($ex->ID, '_expense_amount', true));
+        $payee = get_post_meta($ex->ID, '_payee_name', true);
+        if (!$payee) continue;
+        $vdate = get_post_meta($ex->ID, '_expense_date', true) ?: get_the_date('Y-m-d', $ex->ID);
+        $vy = (int) substr($vdate, 0, 4);
+        if ($vy < 1970) $vy = $year;
+        $key = $vy . '|' . $payee;
+        $vendor_totals[$key] = [
+            'year' => $vy,
+            'payee' => $payee,
+            'tin' => get_post_meta($ex->ID, '_payee_tin', true) ?: '—',
+            'amount' => ($vendor_totals[$key]['amount'] ?? 0) + $amt,
+        ];
+    }
+    $ob .= '<h4>1099-NEC — Vendor & Contractor Payments (you → them)</h4>';
+    if ($vendor_totals) {
+        $vt = $vendor_totals;
+        usort($vt, function($a, $b) { return $a['year'] <=> $b['year'] || strcmp($a['payee'], $b['payee']); });
+        $ob .= '<table style="width:100%;border-collapse:collapse;font-size:0.9rem;"><thead><tr style="border-bottom:1px solid var(--surface-border);text-align:left;"><th style="padding:8px 4px;">Year</th><th>Payer (you)</th><th>Vendor</th><th>TIN</th><th style="text-align:right;">Box 1 — Nonemployee Compensation</th><th>1099-NEC?</th></tr></thead><tbody>';
+        foreach ($vt as $v) {
+            $needs = $v['amount'] >= 600;
+            $ob .= '<tr style="border-bottom:1px solid var(--surface-border);"><td style="padding:8px 4px;">' . (int) $v['year'] . '</td><td>Studio Roux (you)</td><td>' . esc_html($v['payee']) . '</td><td>' . esc_html($v['tin']) . '</td><td style="text-align:right;">$' . number_format($v['amount'], 2) . '</td><td>' . ($needs ? '<span style="color:var(--red);font-weight:600;">⚠ YES — $600+</span>' : '<span style="color:var(--text-muted);">No (&lt; $600)</span>') . '</td></tr>';
+        }
+        $ob .= '</tbody></table>';
+        $ob .= '<p style="font-size:0.75rem;color:var(--text-dim);margin-top:8px;">Tracks money you paid non-employee vendors (Expenses marked 1099-eligible). File 1099-NEC with the IRS plus a copy to each vendor at $600+/year, usually by Jan 31. Consult a tax professional.</p>';
+    } else {
+        $ob .= '<p style="color:var(--text-muted);">No 1099-eligible vendor payments recorded for this year. To track, edit an Expense and fill in Payee / Vendor + check 1099-eligible.</p>';
+    }
+
     if (!empty($expenses_by_category)) {
         arsort($expenses_by_category);
         $ob .= '<h4 style="margin-top:24px;">Expense Categories</h4>';
@@ -2975,7 +3209,7 @@ function studio_tax_report_shortcode($atts) {
         }
     }
 
-    $ob .= '<p style="font-size:0.75rem;color:var(--text-dim);margin-top:24px;">Generated: ' . current_time('F j, Y') . ' \u2014 For informational purposes. Consult a tax professional for filing.</p>';
+    $ob .= '<p style="font-size:0.75rem;color:var(--text-dim);margin-top:24px;">Generated: ' . current_time('F j, Y') . ' — For informational purposes. Consult a tax professional for filing.</p>';
     $ob .= '</div>';
     return $ob;
 }
@@ -2987,7 +3221,7 @@ add_shortcode('studio_tax_report', 'studio_tax_report_shortcode');
 function studio_settings_admin_menu() {
     add_menu_page(
         'Studio Settings',
-        'Studio',
+        '🎙 Studio',
         'manage_options',
         'studio-settings',
         'studio_render_service_rates_page',
@@ -3044,6 +3278,62 @@ function studio_render_service_rates_page() {
             <p class="description">Set a rate to 0 to mark a service as free. Consultation is free by default.</p>
             <?php submit_button('Save Rates'); ?>
         </form>
+    </div>
+    <?php
+}
+
+/* ----------------------------------------------
+   TAX REPORT ADMIN PAGE
+   ---------------------------------------------- */
+function studio_tax_report_admin_menu() {
+    add_menu_page(
+        'Tax Report',
+        '📊 Tax Report',
+        'manage_options',
+        'studio-tax-report',
+        'studio_render_tax_report_page',
+        'dashicons-chart-bar',
+        26
+    );
+}
+add_action('admin_menu', 'studio_tax_report_admin_menu');
+
+function studio_render_tax_report_page() {
+    if (!current_user_can('manage_options')) wp_die('Unauthorized');
+
+    $year = isset($_GET['year']) ? (int) $_GET['year'] : (int) current_time('Y');
+    if ($year < 2000) $year = (int) current_time('Y');
+    $options = range($year, 2020);
+    ?>
+    <style>
+    .tax-report-wrap { --text-muted:#646970; --text-dim:#8f98a0; --green:#00875a; --red:#d63638; --blue:#2271b1; --surface-border:#e2e4e7; background:#fff; padding:24px; border:1px solid #e2e4e7; max-width:900px; }
+    .tax-report-wrap .glass { background:#fff; padding:0; width:100%; border:none; box-shadow:none; }
+    .tax-report-wrap h3, .tax-report-wrap h4 { color:#1d2327; }
+    .tax-report-wrap table td, .tax-report-wrap table th { background:transparent; color:#1d2327; }
+    @media print {
+        #wpadminbar, #adminmenu, #wpcontent::before, .tax-actions { display:none !important; }
+        #wpbody { padding:0 !important; }
+        #wpbody-content { padding:0 !important; }
+        .tax-report-wrap { border:none; padding:0; }
+    }
+    </style>
+    <div class="wrap" style="max-width:900px;">
+        <h1>📊 Tax Report — <?php echo esc_html($year); ?></h1>
+        <div class="tax-actions" style="margin-bottom:12px;display:flex;align-items:center;gap:12px;">
+            <form method="get" style="display:flex;align-items:center;gap:8px;">
+                <input type="hidden" name="page" value="studio-tax-report">
+                <select name="year">
+                    <?php foreach ($options as $opt): ?>
+                        <option value="<?php echo esc_attr($opt); ?>"><?php echo esc_html($opt); ?></option>
+                    <?php endforeach; ?>
+                </select>
+                <?php submit_button('Show Year', false, 'submit'); ?>
+            </form>
+            <button type="button" class="button button-secondary" onclick="window.print()">🖨 Print / Save as PDF</button>
+        </div>
+        <div class="tax-report-wrap">
+            <?php echo studio_tax_report_shortcode(['year' => $year]); ?>
+        </div>
     </div>
     <?php
 }
@@ -3168,6 +3458,9 @@ function studio_booking_details_meta_callback($post) {
     $client_email = get_post_meta($post->ID, '_client_email', true);
     $client_phone = get_post_meta($post->ID, '_client_phone', true);
     $service      = get_post_meta($post->ID, '_service', true);
+    // Normalise legacy values like "FOH Engineer - Live Sound ($50/hr)" to the canonical label
+    // (unknown services keep their text so the catch-all option below still offers them).
+    $service = studio_rate_for_service($service)['label'];
     $location     = get_post_meta($post->ID, '_location', true);
     $notes        = get_post_meta($post->ID, '_notes', true);
     $total_hours  = get_post_meta($post->ID, '_total_hours', true);
@@ -3187,9 +3480,37 @@ function studio_booking_details_meta_callback($post) {
     }
     $discount     = floatval(get_post_meta($post->ID, '_discount', true));
     $disc_type    = get_post_meta($post->ID, '_discount_type', true) ?: 'percent';
-    $subtotal     = $rate_info['rate'] * (floatval($total_hours) ?: (floatval($rate_info['rate']) > 0 && !$rate_info['hourly'] ? 1 : 0));
+    $tax_rate     = max(0, floatval(get_post_meta($post->ID, '_tax_rate', true)));
+    $custom_rate  = floatval(get_post_meta($post->ID, '_custom_rate', true));
+    $counter_rate = floatval(get_post_meta($post->ID, '_counter_rate', true));
+    $counter_message = get_post_meta($post->ID, '_counter_message', true);
+    $custom_basis  = get_post_meta($post->ID, '_custom_basis', true);
+    $counter_basis = get_post_meta($post->ID, '_counter_basis', true);
+    if (!in_array($custom_basis, array('hr', 'flat'), true)) $custom_basis = $rate_info['hourly'] ? 'hr' : 'flat';
+    if (!in_array($counter_basis, array('hr', 'flat'), true)) $counter_basis = $rate_info['hourly'] ? 'hr' : 'flat';
+    $rate_mode    = get_post_meta($post->ID, '_rate_mode', true) ?: 'standard';
+    if (!in_array($rate_mode, array('standard', 'custom', 'counter'), true)) $rate_mode = 'standard';
+    $eff_qty = max(1, floatval($total_hours));
+    if ($rate_mode === 'custom') {
+        $eff_rate = $custom_rate;
+        $eff_hourly = $custom_basis === 'hr';
+        if (!$eff_hourly) $eff_qty = 1; // fixed total
+    } elseif ($rate_mode === 'counter') {
+        $eff_rate = $counter_rate;
+        $eff_hourly = $counter_basis === 'hr';
+        if (!$eff_hourly) $eff_qty = 1; // fixed total
+    } else {
+        $eff_rate = $rate_info['rate'];
+        $eff_hourly = $rate_info['hourly'];
+        if (!$eff_hourly && $eff_rate > 0) $eff_qty = 1;
+        if ($eff_rate === 0) $eff_qty = 0;
+    }
+    $eff_label = ($rate_mode === 'counter' ? 'Counter ' . '$' . number_format($eff_rate, 2) . ($eff_hourly ? '/hr' : ' flat')
+        : ($rate_mode === 'custom' ? 'Custom ' : '') . '$' . number_format($eff_rate, 2) . ($eff_hourly ? '/hr' : ' flat'));
+    $subtotal     = $eff_rate * $eff_qty;
     $disc_amount  = $discount > 0 ? ($disc_type === 'percent' ? $subtotal * $discount / 100 : $discount) : 0;
-    $total        = max(0, $subtotal - $disc_amount);
+    $tax_amount   = max(0, $subtotal - $disc_amount) * $tax_rate / 100;
+    $total        = max(0, $subtotal - $disc_amount) + $tax_amount;
     $deposit      = round($total * 0.5, 2);
     ?>
     <style>
@@ -3232,7 +3553,7 @@ function studio_booking_details_meta_callback($post) {
                     <?php foreach ($rates as $key => $info) : ?>
                     <option value="<?php echo esc_attr($info['label']); ?>" <?php selected($service, $info['label']); ?>><?php echo esc_html($info['label'] . ' — ' . $info['desc']); ?></option>
                     <?php endforeach; ?>
-                    <?php if ($service && !array_key_exists($service, $rates) && !in_array($service, array_column($rates, 'label'))) : ?>
+                    <?php if ($service && $service !== 'No service selected' && !in_array($service, array_column($rates, 'label'))) : ?>
                     <option value="<?php echo esc_attr($service); ?>" selected><?php echo esc_html($service); ?></option>
                     <?php endif; ?>
                 </select>
@@ -3271,6 +3592,26 @@ function studio_booking_details_meta_callback($post) {
         <p style="font-size:12px;"><label><input type="checkbox" name="resend_to_client" value="1"> Email updated booking details and deposit link to the client after saving</label></p>
         <?php else : ?>
         <div class="bk-grid">
+            <p><label>Rate Mode<br>
+                <select name="_rate_mode" id="bk-rate-mode">
+                    <option value="standard" <?php selected($rate_mode, 'standard'); ?>>Standard Rate</option>
+                    <option value="custom" <?php selected($rate_mode, 'custom'); ?>>Custom Amount (private)</option>
+                    <option value="counter" <?php selected($rate_mode, 'counter'); ?>>Counter-Offer (send to client)</option>
+                </select>
+            </label></p>
+            <p><label>Tax Rate (%)<br><input type="number" name="_tax_rate" id="bk-tax-rate" step="0.001" min="0" value="<?php echo esc_attr($tax_rate ?: ''); ?>" placeholder="e.g. 8.25" style="width:100%;"></label></p>
+        </div>
+        <div class="bk-grid" id="bk-custom-panel" style="<?php echo $rate_mode === 'custom' ? '' : 'display:none;'; ?>">
+            <p><label>Custom Amount<br><select name="_custom_basis" id="bk-custom-basis" style="float:left;margin:0 6px 6px 0;"><option value="hr" <?php selected($custom_basis, 'hr'); ?>>$/hr</option><option value="flat" <?php selected($custom_basis, 'flat'); ?>>fixed total</option></select><input type="number" name="_custom_rate" id="bk-custom-rate" step="0.01" min="0" value="<?php echo esc_attr($custom_rate ?: ''); ?>" placeholder="e.g. 300" style="width:70%;"></label></p>
+        </div>
+        <div id="bk-counter-panel" style="<?php echo $rate_mode === 'counter' ? '' : 'display:none;'; ?>">
+            <div class="bk-grid">
+                <p><label>Counter Amount<br><select name="_counter_basis" id="bk-counter-basis" style="float:left;margin:0 6px 6px 0;"><option value="hr" <?php selected($counter_basis, 'hr'); ?>>$/hr</option><option value="flat" <?php selected($counter_basis, 'flat'); ?>>fixed total</option></select><input type="number" name="_counter_rate" id="bk-counter-rate" step="0.01" min="0" value="<?php echo esc_attr($counter_rate ?: ''); ?>" placeholder="e.g. 300" style="width:70%;"></label></p>
+            </div>
+            <p style="margin-top:8px;"><label>Message to Client<br><textarea name="_counter_message" rows="3" style="width:100%;"><?php echo esc_textarea($counter_message); ?></textarea></label></p>
+            <p style="font-size:11px;color:#666;margin:6px 0 0;">Saving in Counter-Offer mode sets the booking status to <strong>Counter-Offer</strong> so the client sees Accept / Decline in their portal.</p>
+        </div>
+        <div class="bk-grid">
             <p><label>Discount Type<br>
                 <select name="_discount_type">
                     <option value="percent" <?php selected($disc_type, 'percent'); ?>>Percent (%)</option>
@@ -3279,6 +3620,9 @@ function studio_booking_details_meta_callback($post) {
             </label></p>
             <p><label>Discount Value<br><input type="number" name="_discount" step="0.01" min="0" value="<?php echo esc_attr($discount ?: ''); ?>" placeholder="e.g. 10 for 10% or 50 for $50" style="width:100%;"></label></p>
         </div>
+        <?php $promo_code = get_post_meta($post->ID, '_promo_code', true); if ($promo_code) : ?>
+        <p style="font-size:12px;color:#666;"><strong>Promo code</strong> <?php echo esc_html($promo_code); ?> was entered by the client — discount above was pre-filled from the promotion. Edit the value to override.</p>
+        <?php endif; ?>
         <?php endif; ?>
 
         <?php if (in_array($status, ['New', 'Pending'], true)) : ?>
@@ -3292,7 +3636,7 @@ function studio_booking_details_meta_callback($post) {
 
         <div class="bk-summary">
             <table>
-                <tr><td>Rate</td><td class="bk-amt" id="bk-rate"><?php echo $rate_info['hourly'] ? '$' . number_format($rate_info['rate'], 2) . '/hr' : '$' . number_format($rate_info['rate'], 2) . ' flat'; ?></td></tr>
+                <tr><td>Rate</td><td class="bk-amt" id="bk-rate"><?php echo esc_html($eff_label); ?></td></tr>
                 <tr><td>Total Hours</td><td class="bk-amt" id="bk-total-hours"><?php echo esc_html($total_hours ?: 0); ?></td></tr>
                 <tr><td>Subtotal</td><td class="bk-amt" id="bk-subtotal">$<?php echo number_format($subtotal, 2); ?></td></tr>
                 <?php if ($discount > 0) : ?>
@@ -3300,6 +3644,7 @@ function studio_booking_details_meta_callback($post) {
                 <?php else : ?>
                 <tr><td>Discount</td><td class="bk-amt" id="bk-discount-line">$0.00</td></tr>
                 <?php endif; ?>
+                <tr><td>Tax</td><td class="bk-amt" id="bk-tax">$<?php echo number_format($tax_amount, 2); ?></td></tr>
                 <tr style="border-top:2px solid #d4a574;"><td><strong>Total</strong></td><td class="bk-amt"><strong id="bk-total">$<?php echo number_format($total, 2); ?></strong></td></tr>
                 <tr><td>50% Deposit</td><td class="bk-amt" id="bk-deposit">$<?php echo number_format($deposit, 2); ?></td></tr>
             </table>
@@ -3315,6 +3660,14 @@ function studio_booking_details_meta_callback($post) {
             var rateDisplay = document.getElementById('bk-rate');
             var discountInput = document.querySelector('input[name="_discount"]');
             var discountTypeSelect = document.querySelector('select[name="_discount_type"]');
+            var modeSelect = document.getElementById('bk-rate-mode');
+            var customRateInput = document.getElementById('bk-custom-rate');
+            var counterRateInput = document.getElementById('bk-counter-rate');
+            var customBasisSelect = document.getElementById('bk-custom-basis');
+            var counterBasisSelect = document.getElementById('bk-counter-basis');
+            var taxRateInput = document.getElementById('bk-tax-rate');
+            var customPanel = document.getElementById('bk-custom-panel');
+            var counterPanel = document.getElementById('bk-counter-panel');
             var storedDiscount = <?php echo wp_json_encode($discount); ?>;
             var storedDiscountType = <?php echo wp_json_encode($disc_type); ?>;
 
@@ -3336,17 +3689,25 @@ function studio_booking_details_meta_callback($post) {
             function recalc(){
                 var totalHrs = 0;
                 rows.querySelectorAll('.bk-slot-row').forEach(function(r){ totalHrs += calcSlotHours(r); });
-                var isFlat = !rateEl.hourly && rateEl.rate > 0;
-                var effectiveHrs = isFlat ? 1 : (rateEl.rate === 0 ? 0 : totalHrs);
-                var subtotal = rateEl.rate * effectiveHrs;
+                var mode = modeSelect ? modeSelect.value : 'standard';
+                var effRate = 0, effHourly = true, modeLabel = '';
+                if (mode === 'custom') { effRate = customRateInput ? (parseFloat(customRateInput.value) || 0) : 0; effHourly = customBasisSelect ? customBasisSelect.value === 'hr' : rateEl.hourly; modeLabel = 'Custom '; }
+                else if (mode === 'counter') { effRate = counterRateInput ? (parseFloat(counterRateInput.value) || 0) : 0; effHourly = counterBasisSelect ? counterBasisSelect.value === 'hr' : rateEl.hourly; modeLabel = 'Counter '; }
+                else { effRate = rateEl.rate; effHourly = rateEl.hourly; }
+                var effectiveHrs = effRate === 0 ? 0 : (!effHourly ? 1 : totalHrs);
+                var subtotal = effRate * effectiveHrs;
                 var discVal = discountInput ? (parseFloat(discountInput.value) || 0) : storedDiscount;
                 var discType = discountTypeSelect ? discountTypeSelect.value : storedDiscountType;
                 var discAmt = discVal > 0 ? (discType === 'percent' ? subtotal * discVal / 100 : discVal) : 0;
-                var total = Math.max(0, subtotal - discAmt);
+                var taxRate = taxRateInput ? (parseFloat(taxRateInput.value) || 0) : 0;
+                var taxAmt = Math.max(0, subtotal - discAmt) * taxRate / 100;
+                var total = Math.max(0, subtotal - discAmt) + taxAmt;
                 var deposit = Math.round(total * 0.5 * 100) / 100;
+                rateDisplay.textContent = modeLabel + '$' + effRate.toFixed(2) + (effHourly ? '/hr' : ' flat');
                 document.getElementById('bk-total-hours').textContent = totalHrs.toFixed(2).replace(/\.?0+$/,'') || '0';
                 document.getElementById('bk-subtotal').textContent = '$' + subtotal.toFixed(2);
                 document.getElementById('bk-discount-line').textContent = discAmt > 0 ? '-$' + discAmt.toFixed(2) : '$0.00';
+                document.getElementById('bk-tax').textContent = '$' + taxAmt.toFixed(2);
                 document.getElementById('bk-total').textContent = '$' + total.toFixed(2);
                 document.getElementById('bk-deposit').textContent = '$' + deposit.toFixed(2);
             }
@@ -3384,6 +3745,17 @@ function studio_booking_details_meta_callback($post) {
             });
             if(discountInput) discountInput.addEventListener('input', recalc);
             if(discountTypeSelect) discountTypeSelect.addEventListener('input', recalc);
+            if(customRateInput) customRateInput.addEventListener('input', recalc);
+            if(counterRateInput) counterRateInput.addEventListener('input', recalc);
+            if(customBasisSelect) customBasisSelect.addEventListener('change', recalc);
+            if(counterBasisSelect) counterBasisSelect.addEventListener('change', recalc);
+            if(taxRateInput) taxRateInput.addEventListener('input', recalc);
+            if(modeSelect) modeSelect.addEventListener('change', function(){
+                var m = modeSelect.value;
+                if (customPanel) customPanel.style.display = m === 'custom' ? '' : 'none';
+                if (counterPanel) counterPanel.style.display = m === 'counter' ? '' : 'none';
+                recalc();
+            });
             addBtn.addEventListener('click', addSlot);
             recalc();
         })();
@@ -3393,39 +3765,11 @@ function studio_booking_details_meta_callback($post) {
 }
 
 /*
-   SAVE BOOKING META (handles details box + counter-offer form)
+   SAVE BOOKING META (handles details box)
 */
 function studio_save_booking_meta($post_id) {
     if (defined('DOING_AUTOSAVE') && DOING_AUTOSAVE) return;
     if (!current_user_can('edit_post', $post_id)) return;
-
-    // Counter-offer form (separate nonce)
-    if (isset($_POST['studio_counter_offer']) && isset($_POST['_co_nonce']) && wp_verify_nonce($_POST['_co_nonce'], 'studio_counter_offer')) {
-        $new_rate  = floatval($_POST['co_rate'] ?? 0);
-        $new_hours = floatval($_POST['co_hours'] ?? get_post_meta($post_id, '_total_hours', true));
-        $message   = sanitize_textarea_field($_POST['co_message'] ?? '');
-        update_post_meta($post_id, '_status', 'Counter-Offer');
-        update_post_meta($post_id, '_counter_rate', $new_rate);
-        update_post_meta($post_id, '_counter_hours', $new_hours);
-        update_post_meta($post_id, '_counter_message', $message);
-        studio_cache_flush('studio_dashboard_overview');
-        $client_email = get_post_meta($post_id, '_client_email', true);
-        $name = get_the_title($post_id);
-        $token = get_post_meta($post_id, '_access_token', true) ?: studio_generate_token($post_id);
-        if ($client_email) {
-            $accept_url  = home_url("/booking-action/?action=accept_counter&booking_id=$post_id&token=$token");
-            $decline_url = home_url("/booking-action/?action=decline_counter&booking_id=$post_id&token=$token");
-            studio_send_email($client_email, "Counter Offer for Your Booking",
-                '<p>Hi ' . esc_html($name) . ', we have a counter offer for your booking:</p>' .
-                '<p><strong>New total:</strong> $' . number_format((float) $new_rate * (float) $new_hours, 2) . '</p>' .
-                ($message ? '<p><strong>Note:</strong> ' . esc_html($message) . '</p>' : '') .
-                '<p><a href="' . $accept_url . '" style="display:inline-block;padding:12px 32px;background:#d4a574;color:#0a0a0a;text-decoration:none;border-radius:8px;font-weight:bold;">Accept Counter Offer</a></p>' .
-                '<p style="margin-top:12px;"><a href="' . $decline_url . '" style="color:#888;">Decline Counter Offer</a></p>');
-            studio_send_email(get_option('admin_email'), "Counter Offer Sent — Booking #{$post_id}",
-                '<p>Counter offer for <strong>' . esc_html($name) . '</strong>: $' . number_format($new_rate, 2) . '/hr &times; ' . $new_hours . ' hrs.</p>');
-        }
-        return;
-    }
 
     // Details box save
     if (!isset($_POST['_studio_booking_nonce']) || !wp_verify_nonce($_POST['_studio_booking_nonce'], 'studio_save_booking')) return;
@@ -3481,6 +3825,62 @@ function studio_save_booking_meta($post_id) {
         if (isset($_POST['_discount_type'])) {
             update_post_meta($post_id, '_discount_type', sanitize_text_field($_POST['_discount_type']));
         }
+        // Rate Mode (standard / custom / counter)
+        // Only persist when the field was actually submitted — other sub-forms sharing this
+        // handler must not silently reset a saved custom/counter mode back to standard
+        $rm_submitted = isset($_POST['_rate_mode']);
+        if ($rm_submitted) {
+            $rm = sanitize_text_field($_POST['_rate_mode']);
+            if (!in_array($rm, ['standard', 'custom', 'counter'], true)) $rm = 'standard';
+            update_post_meta($post_id, '_rate_mode', $rm);
+            studio_log_error('BOOKING SAVE: rate mode', ['post_id' => $post_id, 'rate_mode' => $rm, 'custom_rate' => $_POST['_custom_rate'] ?? null, 'custom_basis' => $_POST['_custom_basis'] ?? null, 'custom_panel_visible' => true]);
+        } else {
+            $rm = get_post_meta($post_id, '_rate_mode', true) ?: 'standard';
+            studio_log_error('BOOKING SAVE: rate mode field absent, keeping saved mode', ['post_id' => $post_id, 'kept' => $rm]);
+        }
+        // Leaving counter mode releases the Counter-Offer lock so Approve Now works again
+        if ($rm !== 'counter' && $status === 'Counter-Offer') {
+            update_post_meta($post_id, '_status', 'Pending');
+            $status = 'Pending';
+        }
+        if ($rm_submitted && $rm === 'custom') {
+            update_post_meta($post_id, '_custom_rate', max(0, floatval($_POST['_custom_rate'] ?? 0)));
+            $cb = sanitize_text_field($_POST['_custom_basis'] ?? '');
+            if (!in_array($cb, ['hr', 'flat'], true)) $cb = ''; // empty = derive from service type
+            update_post_meta($post_id, '_custom_basis', $cb);
+        }
+        if ($rm_submitted && $rm === 'counter') {
+            update_post_meta($post_id, '_counter_rate', max(0, floatval($_POST['_counter_rate'] ?? 0)));
+            $xnb = sanitize_text_field($_POST['_counter_basis'] ?? '');
+            if (!in_array($xnb, ['hr', 'flat'], true)) $xnb = '';
+            update_post_meta($post_id, '_counter_basis', $xnb);
+            update_post_meta($post_id, '_counter_message', sanitize_textarea_field($_POST['_counter_message'] ?? ''));
+            $cur_status = get_post_meta($post_id, '_status', true) ?: 'New';
+            if ($cur_status !== 'Approved' && $cur_status !== 'Counter-Offer') {
+                update_post_meta($post_id, '_status', 'Counter-Offer');
+            }
+            // Email the client to view + respond to the counter offer
+            $c_email = get_post_meta($post_id, '_client_email', true);
+            if ($c_email) {
+                $c_token = get_post_meta($post_id, '_access_token', true) ?: studio_generate_token($post_id);
+                $c_portal = add_query_arg('token', $c_token, home_url('/client-area/'));
+                $service_c = sanitize_text_field(get_post_meta($post_id, '_service', true));
+                $c_name = get_the_title($post_id);
+                $msg_c = trim(sanitize_textarea_field($_POST['_counter_message'] ?? ''));
+                $c_rate = max(0, floatval($_POST['_counter_rate'] ?? 0));
+                $c_basis = sanitize_text_field($_POST['_counter_basis'] ?? '');
+                if (!in_array($c_basis, ['hr', 'flat'], true)) $c_basis = studio_rate_for_service($service_c)['hourly'] ? 'hr' : 'flat';
+                $c_total = $c_basis === 'hr' ? $c_rate * max(1, $total_hours) : $c_rate; // clients see a single total
+                studio_send_email($c_email, "An Updated Quote for Your Booking",
+                    '<p>Hi ' . esc_html($c_name) . ',</p>' .
+                    '<p>Regarding your booking for <strong>' . esc_html($service_c ? $service_c : 'studio session') . '</strong>, we\'ve put together an updated quote.</p>' .
+                    ($msg_c ? '<p>' . nl2br(esc_html($msg_c)) . '</p>' : '') .
+                    '<p style="font-size:1.3em;font-weight:bold;margin:16px 0;">New Total: $' . number_format($c_total, 2) . '</p>' .
+                    '<p><a href="' . esc_url($c_portal) . '" style="display:inline-block;padding:12px 32px;background:#d4a574;color:#0a0a0a;text-decoration:none;border-radius:8px;font-weight:bold;">Review This Offer</a></p>' .
+                    '<p style="font-size:12px;color:#888;">Open the link to accept or decline. Once you accept, you\'ll be taken to payment.</p>');
+            }
+        }
+        update_post_meta($post_id, '_tax_rate', max(0, floatval($_POST['_tax_rate'] ?? 0)));
     }
 
     // "Approve Now" from the Details form: apply the freshly-saved service + discount, price it, create the invoice and email the client.
@@ -3491,7 +3891,15 @@ function studio_save_booking_meta($post_id) {
         }
         $disc = floatval(get_post_meta($post_id, '_discount', true));
         $dtyp = get_post_meta($post_id, '_discount_type', true) ?: 'percent';
-        studio_do_approve($post_id, $disc, $dtyp);
+        $rm = get_post_meta($post_id, '_rate_mode', true) ?: 'standard';
+        // Counter mode waits for the client to accept in their portal; never auto-approved
+        if ($rm === 'counter') {
+            studio_cache_flush('studio_dashboard_overview');
+            wp_redirect(admin_url('edit.php?post_type=studio_booking&counter_from_edit=' . $post_id));
+            exit;
+        }
+        $cRate = ($rm === 'custom') ? floatval(get_post_meta($post_id, '_custom_rate', true)) : 0;
+        studio_do_approve($post_id, $disc, $dtyp, $cRate > 0 ? $cRate : null);
         studio_cache_flush('studio_dashboard_overview');
         wp_redirect(admin_url('edit.php?post_type=studio_booking&approved_from_edit=' . $post_id));
         exit;
@@ -3510,6 +3918,5 @@ add_action('save_post_studio_booking', 'studio_save_booking_meta');
 function studio_booking_meta_boxes() {
     add_meta_box('studio_booking_details', 'Booking Details', 'studio_booking_details_meta_callback', 'studio_booking', 'normal', 'high');
     add_meta_box('studio_booking_actions', 'Booking Actions', 'studio_booking_actions_meta_callback', 'studio_booking', 'side', 'high');
-    add_meta_box('studio_booking_counter', 'Counter Offer', 'studio_counter_offer_meta_callback', 'studio_booking', 'side', 'default');
 }
 add_action('add_meta_boxes', 'studio_booking_meta_boxes');
