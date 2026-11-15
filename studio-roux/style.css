@@ -278,13 +278,17 @@ tr:hover{background:rgba(255,255,255,0.02)}
   /* Hamburger visible */
   .nav-toggle{display:flex}
 
+  /* Solid header/frame on mobile — no backdrop blur, so the menu can't composite see-through */
+  .site-header{
+    backdrop-filter:none;-webkit-backdrop-filter:none;
+  }
+
   /* Dropdown nav below header */
   .site-nav{
     display:none;
     position:absolute;
     top:100%;left:0;right:0;
-    background:rgba(15,15,15,0.98);
-    backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
+    background:#101010;
     z-index:1001;
     flex-direction:column;
     align-items:stretch;
